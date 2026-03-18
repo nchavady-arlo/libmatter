@@ -38,15 +38,16 @@ CXXFLAGS += -DCHIP_HAVE_CONFIG_H=1
 CXXFLAGS += $(shell $(PKG_CONFIG) --cflags glib-2.0 gio-2.0 2>/dev/null)
 
 LDFLAGS += -shared -fPIC
-LDFLAGS += -lCHIP
 LDFLAGS += $(shell $(PKG_CONFIG) --libs glib-2.0 gio-2.0 2>/dev/null)
 LDFLAGS += $(shell $(PKG_CONFIG) --libs avahi-client 2>/dev/null)
+
+LIBS += -Wl,--whole-archive -lCHIP -Wl,--no-whole-archive
 
 all: $(OBJDIR)/$(TARGET_LIB)
 
 $(OBJDIR)/$(TARGET_LIB): $(OBJS)
 	$(Q)echo "  [LD] $(TARGET_LIB)"
-	$(Q)$(CXX) $(LDFLAGS) -o $@ $^
+	$(Q)$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 $(OBJDIR)/%.o: controller/%.cpp
 	$(Q)echo "  [CXX] $(@:$(OBJDIR)/%=%)"
