@@ -15,7 +15,7 @@
 #include "MatterPublish.h"
 #include "MatterJsonUtils.h"
 #include "logger.h"
-#include "matter_interface.h"
+#include "devif/agw_matter_api.h"
 
 static json_t* BuildMeta(uint64_t nodeId, uint16_t endpointId, uint32_t clusterId)
 {
@@ -25,27 +25,28 @@ static json_t* BuildMeta(uint64_t nodeId, uint16_t endpointId, uint32_t clusterI
                      "clusterId", (json_int_t)clusterId);
 }
 
-static void Publish(uint64_t nodeId, uint16_t endpointId, uint32_t clusterId, const char* key, json_t* data)
-{
-    char resource[64];
-    snprintf(resource, sizeof(resource), "matter/%013llu", (unsigned long long)nodeId);
-
-    json_t* payload = json_object();
-    json_object_set_new(payload, "meta", BuildMeta(nodeId, endpointId, clusterId));
-    json_object_set_new(payload, key, data);
-
-    CharAutoPtr dump(json_dumps(payload, JSON_COMPACT));
-    _LOG_INFO("Publish: %s %s", resource, dump ? dump.get() : "{}");
-
-    matter_event_handler(resource, payload);
-}
-
 void MatterPublish::AttributeUpdate(uint64_t nodeId, uint16_t endpointId, uint32_t clusterId, json_t* attributes)
 {
-    Publish(nodeId, endpointId, clusterId, "attribute", attributes);
+    json_t* payload = json_object();
+    json_object_set_new(payload, "meta", BuildMeta(nodeId, endpointId, clusterId));
+    json_object_set_new(payload, "attribute", attributes);
+
+    CharAutoPtr dump(json_dumps(payload, JSON_COMPACT));
+    _LOG_INFO("AttributeUpdate: node=%llu %s", (unsigned long long)nodeId, dump ? dump.get() : "{}");
+
+    agw_matter_device_attribute_handler(nodeId, payload);
+    json_decref(payload);
 }
 
 void MatterPublish::EventUpdate(uint64_t nodeId, uint16_t endpointId, uint32_t clusterId, json_t* events)
 {
-    Publish(nodeId, endpointId, clusterId, "event", events);
+    json_t* payload = json_object();
+    json_object_set_new(payload, "meta", BuildMeta(nodeId, endpointId, clusterId));
+    json_object_set_new(payload, "event", events);
+
+    CharAutoPtr dump(json_dumps(payload, JSON_COMPACT));
+    _LOG_INFO("EventUpdate: node=%llu %s", (unsigned long long)nodeId, dump ? dump.get() : "{}");
+
+    agw_matter_device_event_handler(nodeId, payload);
+    json_decref(payload);
 }

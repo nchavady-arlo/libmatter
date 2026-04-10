@@ -18,7 +18,7 @@
 #include "MatterCommand.h"
 #include "MatterSession.h"
 #include "MatterSubscribe.h"
-#include "matter_interface.h"
+#include "devif/agw_matter_api.h"
 #include <platform/CHIPDeviceLayer.h>
 #include <platform/ConnectivityManager.h>
 #include <app/server/Server.h>
@@ -38,6 +38,7 @@
 #include <controller/CommissioningDelegate.h>
 #include <credentials/attestation_verifier/DefaultDeviceAttestationVerifier.h>
 #include <credentials/attestation_verifier/DeviceAttestationVerifier.h>
+#include <credentials/CHIPCert.h>
 #include <credentials/PersistentStorageOpCertStore.h>
 #include <credentials/GroupDataProviderImpl.h>
 #include <crypto/DefaultSessionKeystore.h>
@@ -109,7 +110,7 @@ class MatterControllerImpl : public chip::Controller::DevicePairingDelegate
 public:
     enum class Action { kCommand, kRead, kWrite, kSubscribe, kUnknown };
 
-    MatterControllerImpl() : mRunning(false), mFabricId(1), mTestVerifier(std::make_unique<TestDeviceAttestationVerifier>()) {}
+    MatterControllerImpl() : mInitialized(false), mRunning(false), mTestVerifier(std::make_unique<TestDeviceAttestationVerifier>()) {}
     ~MatterControllerImpl() {}
 
     bool IsRunning() const { return mRunning; }
@@ -141,7 +142,13 @@ public:
         chip::Logging::SetLogFilter(static_cast<uint8_t>(result));
     }
 
-    bool Start(uint64_t fabricId, log_levels_t level) {
+    // Phase 1: Platform + KVS initialization
+    bool Init(log_levels_t level) {
+        if (mInitialized) {
+            _LOG_WARNING("Matter controller already initialized");
+            return true;
+        }
+
         SetLogLevel(level);
 
         CHIP_ERROR err = chip::Platform::MemoryInit();
@@ -164,7 +171,112 @@ public:
             return false;
         }
 
-        mFabricId = fabricId;
+        // Initialize storage delegates on CHIP thread
+        struct InitContext {
+            MatterControllerImpl* self;
+            std::promise<bool> promise;
+        };
+
+        InitContext ctx{this, {}};
+        auto future = ctx.promise.get_future();
+
+        chip::DeviceLayer::PlatformMgr().ScheduleWork([](intptr_t arg) {
+            auto* ctx = reinterpret_cast<InitContext*>(arg);
+            auto* self = ctx->self;
+
+            chip::DeviceLayer::ConnectivityMgr().SetBLEAdvertisingEnabled(false);
+            chip::DeviceLayer::Internal::BLEMgrImpl().ConfigureBle(0, true);
+
+            self->mStorage.Init(&chip::DeviceLayer::PersistedStorage::KeyValueStoreMgr());
+            self->mOpKeystore.Init(&self->mStorage);
+            self->mOpCertStore.Init(&self->mStorage);
+
+            self->mGroupDataProvider.SetStorageDelegate(&self->mStorage);
+            self->mGroupDataProvider.SetSessionKeystore(&self->mSessionKeystore);
+            self->mGroupDataProvider.Init();
+
+            ctx->promise.set_value(true);
+        }, reinterpret_cast<intptr_t>(&ctx));
+
+        if (!future.get()) {
+            _LOG_ERROR("Matter controller storage init failed on CHIP thread.");
+            return false;
+        }
+
+        mInitialized = true;
+        _LOG_INFO("Matter controller initialized (phase 1 complete).");
+        return true;
+    }
+
+    // Phase 2: Check if bootstrap credentials exist in KVS
+    bool IsBootstrapRequired() {
+        if (!mInitialized) {
+            _LOG_ERROR("IsBootstrapRequired called before Init");
+            return true;
+        }
+
+        // Check for all 4 required credential keys in KVS
+        // If any key is missing, bootstrap is required
+        struct CheckContext {
+            MatterControllerImpl* self;
+            std::promise<bool> promise;
+        };
+
+        CheckContext ctx{this, {}};
+        auto future = ctx.promise.get_future();
+
+        chip::DeviceLayer::PlatformMgr().ScheduleWork([](intptr_t arg) {
+            auto* ctx = reinterpret_cast<CheckContext*>(arg);
+            auto* self = ctx->self;
+            bool required = false;
+
+            // Check if we have a fabric entry — if the op cert store has
+            // certs for any fabric index, we consider bootstrap done.
+            // A more robust check would verify all 4 keys individually,
+            // but for now we check if the cert store has any active certs.
+            if (!self->mOpCertStore.HasPendingRootCert() &&
+                !self->mOpCertStore.HasCertificateForFabric(chip::kMinValidFabricIndex,
+                    chip::Credentials::OperationalCertificateStore::CertChainElement::kRcac)) {
+                _LOG_INFO("No RCAC found in KVS — bootstrap required");
+                required = true;
+            }
+
+            ctx->promise.set_value(required);
+        }, reinterpret_cast<intptr_t>(&ctx));
+
+        return future.get();
+    }
+
+    // Phase 2b: Install credentials into KVS (idempotent)
+    bool Bootstrap(const uint8_t *rcac, size_t rcac_len,
+                   const uint8_t *icac, size_t icac_len,
+                   const uint8_t *ipk, size_t ipk_len,
+                   const uint8_t *noc, size_t noc_len) {
+        if (!mInitialized) {
+            _LOG_ERROR("Bootstrap called before Init");
+            return false;
+        }
+
+        // TODO(Chunk 2): Install RCAC/ICAC/NOC/IPK into KVS via PersistentStorageOpCertStore
+        _LOG_INFO("Bootstrap: stub — credential KVS install not yet implemented (Chunk 2)");
+        (void)rcac; (void)rcac_len;
+        (void)icac; (void)icac_len;
+        (void)ipk;  (void)ipk_len;
+        (void)noc;  (void)noc_len;
+        return false;
+    }
+
+    // Phase 3: Setup commissioner and begin operation
+    bool Start() {
+        if (!mInitialized) {
+            _LOG_ERROR("Start called before Init");
+            return false;
+        }
+
+        if (mRunning) {
+            _LOG_WARNING("Matter controller already running");
+            return true;
+        }
 
         struct StartContext {
             MatterControllerImpl* self;
@@ -180,17 +292,7 @@ public:
             bool success = false;
 
             do {
-                chip::DeviceLayer::ConnectivityMgr().SetBLEAdvertisingEnabled(false);
-                chip::DeviceLayer::Internal::BLEMgrImpl().ConfigureBle(0, true);
-
-                self->mStorage.Init(&chip::DeviceLayer::PersistedStorage::KeyValueStoreMgr());
-                self->mOpKeystore.Init(&self->mStorage);
-                self->mOpCertStore.Init(&self->mStorage);
-
-                self->mGroupDataProvider.SetStorageDelegate(&self->mStorage);
-                self->mGroupDataProvider.SetSessionKeystore(&self->mSessionKeystore);
-                self->mGroupDataProvider.Init();
-
+                // Init DeviceControllerFactory
                 chip::Controller::FactoryInitParams factoryParams;
                 factoryParams.systemLayer = &chip::DeviceLayer::SystemLayer();
                 factoryParams.fabricIndependentStorage = &self->mStorage;
@@ -201,20 +303,51 @@ public:
                 factoryParams.groupDataProvider = &self->mGroupDataProvider;
                 factoryParams.bleLayer = chip::DeviceLayer::ConnectivityMgr().GetBleLayer();
 
-                _LOG_INFO("Params: storage=%p, opCertStore=%p, sessionKeystore=%p, opKeystore=%p, groupData=%p, bleLayer=%p",
-                    factoryParams.fabricIndependentStorage,
-                    factoryParams.opCertStore,
-                    factoryParams.sessionKeystore,
-                    factoryParams.operationalKeystore,
-                    factoryParams.groupDataProvider,
-                    factoryParams.bleLayer);
-
                 CHIP_ERROR initErr = chip::Controller::DeviceControllerFactory::GetInstance().Init(factoryParams);
                 if (initErr != CHIP_NO_ERROR) {
                     _LOG_ERROR("Failed to init DeviceControllerFactory: %s", chip::ErrorStr(initErr));
                     break;
                 }
 
+                // Load credentials from KVS (stored by Bootstrap)
+                const chip::FabricIndex kFabricIndex = 1;
+
+                uint8_t rcacBuf[chip::Controller::kMaxCHIPDERCertLength];
+                chip::MutableByteSpan rcacSpan(rcacBuf);
+                if (self->mOpCertStore.GetCertificate(kFabricIndex,
+                        chip::Credentials::OperationalCertificateStore::CertChainElement::kRcac, rcacSpan) != CHIP_NO_ERROR) {
+                    _LOG_ERROR("Failed to load RCAC from KVS — bootstrap required");
+                    break;
+                }
+
+                uint8_t icacBuf[chip::Controller::kMaxCHIPDERCertLength];
+                chip::MutableByteSpan icacSpan(icacBuf);
+                if (self->mOpCertStore.GetCertificate(kFabricIndex,
+                        chip::Credentials::OperationalCertificateStore::CertChainElement::kIcac, icacSpan) != CHIP_NO_ERROR) {
+                    _LOG_ERROR("Failed to load ICAC from KVS — bootstrap required");
+                    break;
+                }
+
+                uint8_t nocBuf[chip::Controller::kMaxCHIPDERCertLength];
+                chip::MutableByteSpan nocSpan(nocBuf);
+                if (self->mOpCertStore.GetCertificate(kFabricIndex,
+                        chip::Credentials::OperationalCertificateStore::CertChainElement::kNoc, nocSpan) != CHIP_NO_ERROR) {
+                    _LOG_ERROR("Failed to load NOC from KVS — bootstrap required");
+                    break;
+                }
+
+                // Extract and validate fabricId from RCAC
+                chip::FabricId fabricId = chip::kUndefinedFabricId;
+                CHIP_ERROR extractErr = chip::Credentials::ExtractFabricIdFromCert(rcacSpan, &fabricId);
+                if (extractErr != CHIP_NO_ERROR || fabricId == chip::kUndefinedFabricId) {
+                    _LOG_ERROR("Failed to extract fabricId from RCAC: %s", chip::ErrorStr(extractErr));
+                    break;
+                }
+
+                _LOG_INFO("Loaded credentials from KVS: RCAC=%zu, ICAC=%zu, NOC=%zu, fabricId=%llu",
+                          rcacSpan.size(), icacSpan.size(), nocSpan.size(), (unsigned long long)fabricId);
+
+                // Setup commissioner with loaded credentials
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
                 if (self->mOpCredsIssuer.Initialize(self->mStorage) != CHIP_NO_ERROR) {
@@ -223,32 +356,9 @@ public:
                 }
 #pragma GCC diagnostic pop
 
-                self->mNocBuffer.Alloc(chip::Controller::kMaxCHIPDERCertLength);
-                chip::MutableByteSpan nocSpan(self->mNocBuffer.Get(), chip::Controller::kMaxCHIPDERCertLength);
-
-                self->mIcacBuffer.Alloc(chip::Controller::kMaxCHIPDERCertLength);
-                chip::MutableByteSpan icacSpan(self->mIcacBuffer.Get(), chip::Controller::kMaxCHIPDERCertLength);
-
-                self->mRcacBuffer.Alloc(chip::Controller::kMaxCHIPDERCertLength);
-                chip::MutableByteSpan rcacSpan(self->mRcacBuffer.Get(), chip::Controller::kMaxCHIPDERCertLength);
-
-                self->mCommissionerKey.Initialize(chip::Crypto::ECPKeyTarget::ECDSA);
-
-                const chip::NodeId kCommissionerNodeId = 0x12345;
-
-                CHIP_ERROR genErr = self->mOpCredsIssuer.GenerateNOCChainAfterValidation(kCommissionerNodeId, self->mFabricId, chip::kUndefinedCATs,
-                                                                     self->mCommissionerKey.Pubkey(), rcacSpan, icacSpan, nocSpan);
-                if (genErr != CHIP_NO_ERROR) {
-                    _LOG_ERROR("Failed to generate NOC chain: %s", chip::ErrorStr(genErr));
-                    break;
-                }
-
-                _LOG_INFO("Generated NOC Chain: RCAC=%zu bytes, ICAC=%zu bytes, NOC=%zu bytes", rcacSpan.size(), icacSpan.size(), nocSpan.size());
-
                 chip::Controller::SetupParams setupParams;
                 setupParams.pairingDelegate = self;
                 setupParams.operationalCredentialsDelegate = &self->mOpCredsIssuer;
-                setupParams.operationalKeypair = &self->mCommissionerKey;
                 setupParams.controllerRCAC = rcacSpan;
                 setupParams.controllerICAC = icacSpan;
                 setupParams.controllerNOC = nocSpan;
@@ -263,8 +373,9 @@ public:
                     break;
                 }
 
-                _LOG_INFO("Commissioner initialized");
+                _LOG_INFO("Commissioner initialized with fabricId=%llu", (unsigned long long)fabricId);
 
+                // Set IPK
                 chip::ByteSpan ipkSpan = chip::GroupTesting::DefaultIpkValue::GetDefaultIpk();
 
                 uint64_t compressedFabricId = self->mCommissioner.GetCompressedFabricId();
@@ -276,7 +387,7 @@ public:
                 if (ipkErr != CHIP_NO_ERROR)
                     _LOG_ERROR("Failed to set IPK: %s", chip::ErrorStr(ipkErr));
                 else
-                    _LOG_INFO("IPK set successfully for fabric index %d", self->mCommissioner.GetFabricIndex());
+                    _LOG_INFO("IPK set for fabric index %d", self->mCommissioner.GetFabricIndex());
 
                 success = true;
             } while (false);
@@ -285,12 +396,12 @@ public:
         }, reinterpret_cast<intptr_t>(&ctx));
 
         if (!future.get()) {
-            _LOG_ERROR("Matter controller init failed on CHIP thread.");
+            _LOG_ERROR("Matter controller start failed on CHIP thread.");
             return false;
         }
 
         mRunning = true;
-        _LOG_INFO("Matter controller started.");
+        _LOG_INFO("Matter controller started (phase 3 complete).");
         return true;
     }
 
@@ -318,19 +429,13 @@ public:
 
         chip::Controller::DeviceControllerFactory::GetInstance().Shutdown();
 
+        mInitialized = false;
         _LOG_INFO("Matter controller stopped.");
     }
 
-    bool ParseRequest(const std::string& actionStr, json_t* matterPayload) {
+    bool DeviceCommand(const std::string& actionStr, json_t* matterPayload) {
         if (!mRunning) {
             MatterError::SetResult(matterPayload, MatterErrorCode::kCommandFailed);
-            return false;
-        }
-
-        Action action = ParseAction(actionStr);
-        if (action == Action::kUnknown) {
-            _LOG_ERROR("Unsupported action: %s", actionStr.c_str());
-            MatterError::SetResult(matterPayload, MatterErrorCode::kUnsupportedAction);
             return false;
         }
 
@@ -348,19 +453,52 @@ public:
         chip::EndpointId endpointId = static_cast<chip::EndpointId>(endpointVal);
         chip::ClusterId clusterId = static_cast<chip::ClusterId>(clusterIdVal);
 
-        switch (action) {
-        case Action::kCommand:
-            return ParseCommand(nodeId, endpointId, clusterId, matterPayload);
-        case Action::kSubscribe:
-            return ParseSubscribe(nodeId, endpointId, clusterId, matterPayload);
-        case Action::kRead:
-        case Action::kWrite:
-            _LOG_ERROR("Action '%s' not yet implemented", actionStr.c_str());
-            [[fallthrough]];
-        default:
-            MatterError::SetResult(matterPayload, MatterErrorCode::kUnsupportedAction);
+        return ParseCommand(nodeId, endpointId, clusterId, matterPayload);
+    }
+
+    bool DeviceRead(const std::string& actionStr, json_t* matterPayload) {
+        if (!mRunning) {
+            MatterError::SetResult(matterPayload, MatterErrorCode::kCommandFailed);
             return false;
         }
+        // Stub — will be implemented in a later chunk
+        _LOG_ERROR("DeviceRead: not yet implemented");
+        MatterError::SetResult(matterPayload, MatterErrorCode::kUnsupportedAction);
+        return false;
+    }
+
+    bool DeviceWrite(const std::string& actionStr, json_t* matterPayload) {
+        if (!mRunning) {
+            MatterError::SetResult(matterPayload, MatterErrorCode::kCommandFailed);
+            return false;
+        }
+        // Stub — will be implemented in a later chunk
+        _LOG_ERROR("DeviceWrite: not yet implemented");
+        MatterError::SetResult(matterPayload, MatterErrorCode::kUnsupportedAction);
+        return false;
+    }
+
+    bool DeviceSubscribe(const std::string& actionStr, json_t* matterPayload) {
+        if (!mRunning) {
+            MatterError::SetResult(matterPayload, MatterErrorCode::kCommandFailed);
+            return false;
+        }
+
+        json_int_t nodeIdVal = 0, endpointVal = 0, clusterIdVal = 0;
+        if (json_unpack(matterPayload, "{s:{s:I,s:I,s:I}}",
+                                       "meta",
+                                       "nodeId", &nodeIdVal,
+                                       "endpoint", &endpointVal,
+                                       "clusterId", &clusterIdVal) != 0) {
+            MatterError::SetResult(matterPayload, MatterErrorCode::kInvalidParams);
+            return false;
+        }
+
+        chip::NodeId nodeId       = static_cast<chip::NodeId>(nodeIdVal);
+        chip::EndpointId endpointId = static_cast<chip::EndpointId>(endpointVal);
+        chip::ClusterId clusterId = static_cast<chip::ClusterId>(clusterIdVal);
+
+        return ParseSubscribe(nodeId, endpointId, clusterId, matterPayload);
     }
 
     bool CommissionDevice(uint64_t nodeId, const char* payload, const char* ssid, const char* password) {
@@ -421,6 +559,12 @@ public:
         return true;
     }
 
+    bool DeviceDelete(uint64_t nodeId) {
+        // Stub — will be implemented in Chunk 6 (CMFW-26658)
+        _LOG_INFO("DeviceDelete: stub for node %llu (Chunk 6)", (unsigned long long)nodeId);
+        return false;
+    }
+
     typedef std::tuple<chip::NodeId, chip::EndpointId, chip::ClusterId> SubscribeKey;
 
     void AddSubscribeCallback(chip::NodeId nodeId, chip::EndpointId endpointId,
@@ -476,14 +620,6 @@ public:
     }
 
 private:
-    static Action ParseAction(const std::string& action) {
-        if (action == "command")   return Action::kCommand;
-        if (action == "read")      return Action::kRead;
-        if (action == "write")     return Action::kWrite;
-        if (action == "subscribe") return Action::kSubscribe;
-        return Action::kUnknown;
-    }
-
     bool ParseCommand(chip::NodeId nodeId, chip::EndpointId endpointId, chip::ClusterId clusterId,
                       json_t* matterPayload) {
         json_t* j_command = json_object_get(matterPayload, "command");
@@ -637,8 +773,8 @@ private:
         return true;
     }
 
+    std::atomic<bool> mInitialized;
     std::atomic<bool> mRunning;
-    uint64_t mFabricId;
     chip::Controller::DeviceCommissioner mCommissioner;
     chip::Controller::AutoCommissioner mAutoCommissioner;
     chip::Controller::ExampleOperationalCredentialsIssuer mOpCredsIssuer;
@@ -651,11 +787,6 @@ private:
     chip::DeviceLayer::TestOnlyCommissionableDataProvider mCommissionableDataProvider;
     std::unique_ptr<chip::Credentials::DeviceAttestationVerifier> mTestVerifier;
 
-    chip::Crypto::P256Keypair mCommissionerKey;
-    chip::Platform::ScopedMemoryBuffer<uint8_t> mNocBuffer;
-    chip::Platform::ScopedMemoryBuffer<uint8_t> mIcacBuffer;
-    chip::Platform::ScopedMemoryBuffer<uint8_t> mRcacBuffer;
-
     std::mutex mSubscribeCallbacksMutex;
     std::map<SubscribeKey, MatterSubscribeCallback::Ptr> mSubscribeCallbacks;
 
@@ -666,14 +797,30 @@ private:
 MatterController::MatterController() : mImpl(std::make_unique<MatterControllerImpl>()) {}
 MatterController::~MatterController() = default;
 
-bool MatterController::Start(uint64_t fabricId, log_levels_t level) { return mImpl->Start(fabricId, level); }
+bool MatterController::Init(log_levels_t level) { return mImpl->Init(level); }
+bool MatterController::IsBootstrapRequired() { return mImpl->IsBootstrapRequired(); }
+bool MatterController::Bootstrap(const uint8_t *rcac, size_t rcac_len,
+                                 const uint8_t *icac, size_t icac_len,
+                                 const uint8_t *ipk, size_t ipk_len,
+                                 const uint8_t *noc, size_t noc_len) {
+    return mImpl->Bootstrap(rcac, rcac_len, icac, icac_len, ipk, ipk_len, noc, noc_len);
+}
+bool MatterController::Start() { return mImpl->Start(); }
 void MatterController::Stop() { mImpl->Stop(); }
 void MatterController::SetLogLevel(log_levels_t level) { mImpl->SetLogLevel(level); }
 bool MatterController::IsRunning() const { return mImpl->IsRunning(); }
 
-bool MatterController::ParseRequest(const std::string& action, json_t* matterPayload)
-{
-    return mImpl->ParseRequest(action, matterPayload);
+bool MatterController::DeviceCommand(const std::string& action, json_t* matterPayload) {
+    return mImpl->DeviceCommand(action, matterPayload);
+}
+bool MatterController::DeviceRead(const std::string& action, json_t* matterPayload) {
+    return mImpl->DeviceRead(action, matterPayload);
+}
+bool MatterController::DeviceWrite(const std::string& action, json_t* matterPayload) {
+    return mImpl->DeviceWrite(action, matterPayload);
+}
+bool MatterController::DeviceSubscribe(const std::string& action, json_t* matterPayload) {
+    return mImpl->DeviceSubscribe(action, matterPayload);
 }
 
 bool MatterController::CommissionDevice(uint64_t nodeId, const char* payload, const char* ssid, const char* password)
@@ -686,43 +833,8 @@ bool MatterController::EstablishCaseSessions(const std::vector<uint64_t>& nodeId
     return mImpl->EstablishCaseSessions(nodeIds, retryCount);
 }
 
-// --- C API ---
-
-void matter_controller_start(uint64_t fabricId, log_levels_t level)
+bool MatterController::DeviceDelete(uint64_t nodeId)
 {
-    MatterController::singleton().Start(fabricId, level);
+    return mImpl->DeviceDelete(nodeId);
 }
 
-void matter_controller_stop()
-{
-    MatterController::singleton().Stop();
-}
-
-bool matter_controller_parse_request(const char* action, json_t* matterPayload, json_t* responsePayload)
-{
-    bool result = MatterController::singleton().ParseRequest(action, matterPayload);
-    if (responsePayload) {
-        json_t *outprops = json_object();
-        if (outprops) {
-            json_object_set_new(outprops, "matterPayload", json_deep_copy(matterPayload));
-            json_object_set_new(responsePayload, "properties", outprops);
-        }
-    }
-    return result;
-}
-
-bool matter_controller_is_running()
-{
-    return MatterController::singleton().IsRunning();
-}
-
-bool matter_controller_commission_device(uint64_t nodeId, const char* onboardingPayload, const char* ssid, const char* password)
-{
-    return MatterController::singleton().CommissionDevice(nodeId, onboardingPayload, ssid, password);
-}
-
-bool matter_controller_establish_case(uint64_t nodeId, int retryCount)
-{
-    std::vector<uint64_t> vec(1, nodeId);
-    return MatterController::singleton().EstablishCaseSessions(vec, retryCount);
-}

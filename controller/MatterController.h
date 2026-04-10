@@ -32,14 +32,28 @@ public:
     MatterController();
     ~MatterController();
 
-    bool Start(uint64_t fabricId, log_levels_t level);
+    // Three-phase lifecycle
+    bool Init(log_levels_t level);
+    bool IsBootstrapRequired();
+    bool Bootstrap(const uint8_t *rcac, size_t rcac_len,
+                   const uint8_t *icac, size_t icac_len,
+                   const uint8_t *ipk, size_t ipk_len,
+                   const uint8_t *noc, size_t noc_len);
+    bool Start();
     void Stop();
     void SetLogLevel(log_levels_t level);
     bool IsRunning() const;
 
-    bool ParseRequest(const std::string& action, json_t* matterPayload);
+    // Device control (split from ParseRequest)
+    bool DeviceCommand(const std::string& action, json_t* matterPayload);
+    bool DeviceRead(const std::string& action, json_t* matterPayload);
+    bool DeviceWrite(const std::string& action, json_t* matterPayload);
+    bool DeviceSubscribe(const std::string& action, json_t* matterPayload);
+
+    // Commissioning
     bool CommissionDevice(uint64_t nodeId, const char* payload, const char* ssid = nullptr, const char* password = nullptr);
     bool EstablishCaseSessions(const std::vector<uint64_t>& nodeIds, int retryCount);
+    bool DeviceDelete(uint64_t nodeId);
 
     static MatterController& singleton()
     {
