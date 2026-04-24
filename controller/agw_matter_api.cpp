@@ -161,49 +161,4 @@ bool agw_matter_device_delete(uint64_t nodeId)
     return MatterController::singleton().DeviceDelete(nodeId);
 }
 
-// --- Weak callback defaults ---
-// Provide link-time resolution for libmatter.so.
-// arlogw overrides these with strong implementations in matter_callbacks.c.
-
-__attribute__((weak))
-void agw_matter_device_announce_handler(uint64_t nodeId, json_t *deviceInfo)
-{
-    _LOG_INFO("agw_matter_device_announce_handler (weak default): nodeId=%llu", (unsigned long long)nodeId);
-    (void)deviceInfo;
-}
-
-__attribute__((weak))
-void agw_matter_device_attribute_handler(uint64_t nodeId, json_t *matterPayload)
-{
-    _LOG_INFO("agw_matter_device_attribute_handler (weak default): nodeId=%llu", (unsigned long long)nodeId);
-    (void)matterPayload;
-}
-
-__attribute__((weak))
-void agw_matter_device_event_handler(uint64_t nodeId, json_t *matterPayload)
-{
-    _LOG_INFO("agw_matter_device_event_handler (weak default): nodeId=%llu", (unsigned long long)nodeId);
-    (void)matterPayload;
-}
-
-__attribute__((weak))
-void agw_matter_device_connection_handler(uint64_t nodeId, const char *state)
-{
-    _LOG_INFO("agw_matter_device_connection_handler (weak default): nodeId=%llu state=%s",
-              (unsigned long long)nodeId, state ? state : "null");
-}
-
-__attribute__((weak))
-void agw_matter_device_removed_handler(uint64_t nodeId)
-{
-    _LOG_INFO("agw_matter_device_removed_handler (weak default): nodeId=%llu", (unsigned long long)nodeId);
-}
-
-__attribute__((weak))
-void agw_matter_commission_complete_handler(uint64_t nodeId, bool success, const char *error)
-{
-    _LOG_INFO("agw_matter_commission_complete_handler (weak default): nodeId=%llu success=%d error=%s",
-              (unsigned long long)nodeId, success, error ? error : "none");
-}
-
 } // extern "C"
