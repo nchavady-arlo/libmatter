@@ -35,6 +35,7 @@ public:
     // Three-phase lifecycle
     bool Init(log_levels_t level);
     bool IsBootstrapRequired();
+    bool GenerateBootstrapCsr(const char *csr_nonce, char **csr_pem, char **nocsr_elements);
     bool Bootstrap(const uint8_t *rcac, size_t rcac_len,
                    const uint8_t *icac, size_t icac_len,
                    const uint8_t *ipk, size_t ipk_len,

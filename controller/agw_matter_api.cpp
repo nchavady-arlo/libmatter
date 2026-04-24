@@ -25,19 +25,19 @@ static bool ValidateBootstrapInputs(const uint8_t *rcac, size_t rcac_len,
                                     const uint8_t *noc, size_t noc_len)
 {
     if (!rcac || rcac_len == 0) {
-        _LOG_ERR("agw_matter_bootstrap: rcac is NULL or empty");
+        _LOG_ERROR("agw_matter_bootstrap: rcac is NULL or empty");
         return false;
     }
     if (!icac || icac_len == 0) {
-        _LOG_ERR("agw_matter_bootstrap: icac is NULL or empty");
+        _LOG_ERROR("agw_matter_bootstrap: icac is NULL or empty");
         return false;
     }
     if (!ipk || ipk_len == 0) {
-        _LOG_ERR("agw_matter_bootstrap: ipk is NULL or empty");
+        _LOG_ERROR("agw_matter_bootstrap: ipk is NULL or empty");
         return false;
     }
     if (!noc || noc_len == 0) {
-        _LOG_ERR("agw_matter_bootstrap: noc is NULL or empty");
+        _LOG_ERROR("agw_matter_bootstrap: noc is NULL or empty");
         return false;
     }
     return true;
@@ -55,16 +55,31 @@ static bool BuildResponsePayload(json_t *matterPayload, json_t *responsePayload)
     return true;
 }
 
-// --- Public: Lifecycle APIs ---
+// --- Public APIs (extern "C") ---
+// Explicit extern "C" ensures C linkage even if the staging header is stale.
 
-bool agw_matter_init(agw_matter_log_level_t level)
+extern "C" {
+
+// --- Lifecycle APIs ---
+
+bool agw_matter_init(int log_level)
 {
-    return MatterController::singleton().Init(static_cast<log_levels_t>(level));
+    return MatterController::singleton().Init(static_cast<log_levels_t>(log_level));
 }
 
 bool agw_matter_is_bootstrap_required(void)
 {
     return MatterController::singleton().IsBootstrapRequired();
+}
+
+bool agw_matter_generate_bootstrap_csr(const char *csr_nonce, char **csr_pem, char **nocsr_elements)
+{
+    if (!csr_nonce || !csr_pem || !nocsr_elements) {
+        _LOG_ERROR("agw_matter_generate_bootstrap_csr: invalid parameters");
+        return false;
+    }
+
+    return MatterController::singleton().GenerateBootstrapCsr(csr_nonce, csr_pem, nocsr_elements);
 }
 
 bool agw_matter_bootstrap(const uint8_t *rcac, size_t rcac_len,
@@ -93,12 +108,12 @@ bool agw_matter_is_running(void)
     return MatterController::singleton().IsRunning();
 }
 
-void agw_matter_set_loglevel(agw_matter_log_level_t level)
+void agw_matter_set_loglevel(int log_level)
 {
-    MatterController::singleton().SetLogLevel(static_cast<log_levels_t>(level));
+    MatterController::singleton().SetLogLevel(static_cast<log_levels_t>(log_level));
 }
 
-// --- Public: Device control APIs ---
+// --- Device control APIs ---
 
 bool agw_matter_device_command(const char *action, json_t *matterPayload, json_t *responsePayload)
 {
@@ -128,7 +143,7 @@ bool agw_matter_device_subscribe(const char *action, json_t *matterPayload, json
     return result;
 }
 
-// --- Public: Commissioning APIs ---
+// --- Commissioning APIs ---
 
 bool agw_matter_device_commission(uint64_t nodeId, const char *onboardingPayload, const char *ssid, const char *password)
 {
@@ -183,3 +198,12 @@ void agw_matter_device_removed_handler(uint64_t nodeId)
 {
     _LOG_INFO("agw_matter_device_removed_handler (weak default): nodeId=%llu", (unsigned long long)nodeId);
 }
+
+__attribute__((weak))
+void agw_matter_commission_complete_handler(uint64_t nodeId, bool success, const char *error)
+{
+    _LOG_INFO("agw_matter_commission_complete_handler (weak default): nodeId=%llu success=%d error=%s",
+              (unsigned long long)nodeId, success, error ? error : "none");
+}
+
+} // extern "C"

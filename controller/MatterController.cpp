@@ -47,6 +47,8 @@
 #include <platform/TestOnlyCommissionableDataProvider.h>
 #include "MinimalDataModelProvider.h"
 #include <lib/support/logging/CHIPLogging.h>
+#include <credentials/DeviceAttestationConstructor.h>
+#include <lib/support/Base64.h>
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
@@ -109,7 +111,12 @@ class MatterControllerImpl : public chip::Controller::DevicePairingDelegate
 public:
     enum class Action { kCommand, kRead, kWrite, kSubscribe, kUnknown };
 
-    MatterControllerImpl() : mInitialized(false), mRunning(false), mTestVerifier(std::make_unique<TestDeviceAttestationVerifier>()) {}
+    // Commissioning timeout: 4 minutes covers BLE scan + PASE + NOC + WiFi + 3x CASE retry (3×45s)
+    static constexpr uint32_t kCommissionTimeoutMs = 4 * 60 * 1000;
+
+    MatterControllerImpl() : mInitialized(false), mRunning(false), mCommissioningNodeId(0),
+                             mCommissioningInProgress(false),
+                             mTestVerifier(std::make_unique<TestDeviceAttestationVerifier>()) {}
     ~MatterControllerImpl() {}
 
     bool IsRunning() const { return mRunning; }
@@ -226,13 +233,10 @@ public:
         }
 
         return RunOnChipThread([](MatterControllerImpl* self) -> bool {
-            using CertChainElement = chip::Credentials::OperationalCertificateStore::CertChainElement;
-
-            bool hasRcac = self->mOpCertStore.HasCertificateForFabric(self->kFabricIndex, CertChainElement::kRcac);
-            bool hasNoc  = self->mOpCertStore.HasCertificateForFabric(self->kFabricIndex, CertChainElement::kNoc);
-
-            uint16_t ipkSize = 0;
-            bool hasIpk = (self->mStorage.SyncGetKeyValue(self->kIpkStorageKey, nullptr, ipkSize) != CHIP_ERROR_PERSISTED_STORAGE_VALUE_NOT_FOUND);
+            uint16_t dummy = 0;
+            bool hasRcac = (self->mStorage.SyncGetKeyValue(self->kRcacStorageKey, nullptr, dummy) != CHIP_ERROR_PERSISTED_STORAGE_VALUE_NOT_FOUND);
+            bool hasNoc  = (self->mStorage.SyncGetKeyValue(self->kNocStorageKey,  nullptr, dummy) != CHIP_ERROR_PERSISTED_STORAGE_VALUE_NOT_FOUND);
+            bool hasIpk  = (self->mStorage.SyncGetKeyValue(self->kIpkStorageKey,  nullptr, dummy) != CHIP_ERROR_PERSISTED_STORAGE_VALUE_NOT_FOUND);
 
             bool required = !hasRcac || !hasNoc || !hasIpk;
             if (required)
@@ -240,6 +244,112 @@ public:
                           hasRcac ? "ok" : "missing", hasNoc ? "ok" : "missing", hasIpk ? "ok" : "missing");
 
             return required;
+        });
+    }
+
+    // Phase 2a: Generate a keypair and CSR for bootstrap.
+    // Input: base64-encoded csrNonce from backend.
+    // Output: base64-encoded NOCSRElements TLV (caller must free with free()).
+    bool GenerateBootstrapCsr(const char *csr_nonce, char **csr_pem, char **nocsr_elements) {
+        if (!mInitialized) {
+            _LOG_ERROR("GenerateBootstrapCsr called before Init");
+            return false;
+        }
+        if (!csr_nonce || !csr_pem || !nocsr_elements) {
+            _LOG_ERROR("GenerateBootstrapCsr: invalid parameters");
+            return false;
+        }
+
+        // Decode base64 nonce
+        uint16_t nonce_b64_len = static_cast<uint16_t>(strlen(csr_nonce));
+        uint8_t nonceBuf[chip::Credentials::kExpectedAttestationNonceSize];
+        uint16_t nonceLen = chip::Base64Decode(csr_nonce, nonce_b64_len, nonceBuf);
+        if (nonceLen != chip::Credentials::kExpectedAttestationNonceSize) {
+            _LOG_ERROR("GenerateBootstrapCsr: invalid nonce length %u (expected %zu)",
+                       nonceLen, chip::Credentials::kExpectedAttestationNonceSize);
+            return false;
+        }
+        chip::ByteSpan nonceSpan(nonceBuf, nonceLen);
+
+        return RunOnChipThread([nonceSpan, csr_pem, nocsr_elements](MatterControllerImpl* self) -> bool {
+            // Generate new operational keypair + DER-encoded CSR
+            uint8_t csrBuf[chip::Crypto::kMIN_CSR_Buffer_Size];
+            chip::MutableByteSpan csrSpan(csrBuf);
+
+            CHIP_ERROR err = self->mOpKeystore.NewOpKeypairForFabric(self->kFabricIndex, csrSpan);
+            if (err != CHIP_NO_ERROR) {
+                _LOG_ERROR("GenerateBootstrapCsr: NewOpKeypairForFabric failed: %s", chip::ErrorStr(err));
+                return false;
+            }
+
+            _LOG_INFO("GenerateBootstrapCsr: CSR generated (%zu bytes)", csrSpan.size());
+
+            // Build PEM-encoded CSR: base64 of the DER CSR wrapped in PEM markers
+            size_t csrB64Len = BASE64_ENCODED_LEN(csrSpan.size());
+            // PEM format: header + base64 (with line breaks every 64 chars) + footer + null
+            size_t pemMaxLen = 40 + csrB64Len + (csrB64Len / 64) + 40 + 1;
+            char *pemOut = static_cast<char *>(malloc(pemMaxLen));
+            if (!pemOut) {
+                _LOG_ERROR("GenerateBootstrapCsr: out of memory (pem)");
+                self->mOpKeystore.RevertPendingKeypair();
+                return false;
+            }
+
+            char b64Tmp[512];
+            uint16_t b64Written = chip::Base64Encode(csrSpan.data(),
+                                                     static_cast<uint16_t>(csrSpan.size()),
+                                                     b64Tmp);
+            b64Tmp[b64Written] = '\0';
+
+            // Build PEM with 64-char line wrapping
+            int offset = snprintf(pemOut, pemMaxLen, "-----BEGIN CERTIFICATE REQUEST-----\n");
+            for (uint16_t i = 0; i < b64Written; i += 64) {
+                int lineLen = (b64Written - i > 64) ? 64 : (b64Written - i);
+                memcpy(pemOut + offset, b64Tmp + i, lineLen);
+                offset += lineLen;
+                pemOut[offset++] = '\n';
+            }
+            offset += snprintf(pemOut + offset, pemMaxLen - offset, "-----END CERTIFICATE REQUEST-----\n");
+            pemOut[offset] = '\0';
+            *csr_pem = pemOut;
+
+            _LOG_INFO("GenerateBootstrapCsr: PEM CSR built (%d bytes)", offset);
+
+            // Construct NOCSRElements TLV: {csr, csrNonce, vendor_reserved...}
+            uint8_t nocsrBuf[chip::Credentials::kMaxRspLen];
+            chip::MutableByteSpan nocsrSpan(nocsrBuf);
+            chip::ByteSpan emptySpan;
+
+            err = chip::Credentials::ConstructNOCSRElements(csrSpan, nonceSpan,
+                                                            emptySpan, emptySpan, emptySpan,
+                                                            nocsrSpan);
+            if (err != CHIP_NO_ERROR) {
+                _LOG_ERROR("GenerateBootstrapCsr: ConstructNOCSRElements failed: %s", chip::ErrorStr(err));
+                free(*csr_pem); *csr_pem = nullptr;
+                self->mOpKeystore.RevertPendingKeypair();
+                return false;
+            }
+
+            _LOG_INFO("GenerateBootstrapCsr: NOCSRElements built (%zu bytes)", nocsrSpan.size());
+
+            // Base64-encode the NOCSRElements
+            size_t nocsrB64Len = BASE64_ENCODED_LEN(nocsrSpan.size());
+            char *nocsrB64Out = static_cast<char *>(malloc(nocsrB64Len + 1));
+            if (!nocsrB64Out) {
+                _LOG_ERROR("GenerateBootstrapCsr: out of memory (nocsr)");
+                free(*csr_pem); *csr_pem = nullptr;
+                self->mOpKeystore.RevertPendingKeypair();
+                return false;
+            }
+
+            uint16_t nocsrEncoded = chip::Base64Encode(nocsrSpan.data(),
+                                                       static_cast<uint16_t>(nocsrSpan.size()),
+                                                       nocsrB64Out);
+            nocsrB64Out[nocsrEncoded] = '\0';
+            *nocsr_elements = nocsrB64Out;
+
+            _LOG_INFO("GenerateBootstrapCsr: success (pem=%d, nocsr_b64=%u)", offset, nocsrEncoded);
+            return true;
         });
     }
 
@@ -254,49 +364,39 @@ public:
             return false;
         }
 
-        chip::ByteSpan rcacSpan(rcac, rcac_len);
-        chip::ByteSpan icacSpan(icac, icac_len);
-        chip::ByteSpan ipkSpan(ipk, ipk_len);
-        chip::ByteSpan nocSpan(noc, noc_len);
+        // Store raw X.509 DER certs + IPK under our own KVS keys.
+        // We do NOT touch the CHIP SDK's cert store or keystore here —
+        // SetupCommissioner in Start() will handle all SDK-internal state
+        // (cert store, keystore, fabric table) in one atomic operation.
+        CHIP_ERROR err;
 
-        return RunOnChipThread([rcacSpan, icacSpan, ipkSpan, nocSpan](MatterControllerImpl* self) -> bool {
-            // Revert any pending state from a prior failed attempt
-            self->mOpCertStore.RevertPendingOpCerts();
+        err = mStorage.SyncSetKeyValue(kRcacStorageKey, rcac, static_cast<uint16_t>(rcac_len));
+        if (err != CHIP_NO_ERROR) {
+            _LOG_ERROR("Bootstrap: failed to store RCAC: %s", chip::ErrorStr(err));
+            return false;
+        }
 
-            // Store RCAC
-            CHIP_ERROR err = self->mOpCertStore.AddNewTrustedRootCertForFabric(self->kFabricIndex, rcacSpan);
-            if (err != CHIP_NO_ERROR) {
-                _LOG_ERROR("Bootstrap: failed to store RCAC: %s", chip::ErrorStr(err));
-                return false;
-            }
+        err = mStorage.SyncSetKeyValue(kIcacStorageKey, icac, static_cast<uint16_t>(icac_len));
+        if (err != CHIP_NO_ERROR) {
+            _LOG_ERROR("Bootstrap: failed to store ICAC: %s", chip::ErrorStr(err));
+            return false;
+        }
 
-            // Store NOC + ICAC
-            err = self->mOpCertStore.AddNewOpCertsForFabric(self->kFabricIndex, nocSpan, icacSpan);
-            if (err != CHIP_NO_ERROR) {
-                _LOG_ERROR("Bootstrap: failed to store NOC/ICAC: %s", chip::ErrorStr(err));
-                self->mOpCertStore.RevertPendingOpCerts();
-                return false;
-            }
+        err = mStorage.SyncSetKeyValue(kNocStorageKey, noc, static_cast<uint16_t>(noc_len));
+        if (err != CHIP_NO_ERROR) {
+            _LOG_ERROR("Bootstrap: failed to store NOC: %s", chip::ErrorStr(err));
+            return false;
+        }
 
-            // Commit certs to persistent storage
-            err = self->mOpCertStore.CommitOpCertsForFabric(self->kFabricIndex);
-            if (err != CHIP_NO_ERROR) {
-                _LOG_ERROR("Bootstrap: failed to commit certs: %s", chip::ErrorStr(err));
-                self->mOpCertStore.RevertPendingOpCerts();
-                return false;
-            }
+        err = mStorage.SyncSetKeyValue(kIpkStorageKey, ipk, static_cast<uint16_t>(ipk_len));
+        if (err != CHIP_NO_ERROR) {
+            _LOG_ERROR("Bootstrap: failed to store IPK: %s", chip::ErrorStr(err));
+            return false;
+        }
 
-            // Store IPK in raw KVS (needed by Start after SetupCommissioner)
-            err = self->mStorage.SyncSetKeyValue(self->kIpkStorageKey, ipkSpan.data(), static_cast<uint16_t>(ipkSpan.size()));
-            if (err != CHIP_NO_ERROR) {
-                _LOG_ERROR("Bootstrap: failed to store IPK: %s", chip::ErrorStr(err));
-                return false;
-            }
-
-            _LOG_INFO("Bootstrap: credentials installed — RCAC=%zu, ICAC=%zu, NOC=%zu, IPK=%zu",
-                      rcacSpan.size(), icacSpan.size(), nocSpan.size(), ipkSpan.size());
-            return true;
-        });
+        _LOG_INFO("Bootstrap: credentials stored — RCAC=%zu, ICAC=%zu, NOC=%zu, IPK=%zu",
+                  rcac_len, icac_len, noc_len, ipk_len);
+        return true;
     }
 
     // Phase 3: Setup commissioner and begin operation
@@ -312,9 +412,8 @@ public:
         }
 
         bool result = RunOnChipThread([](MatterControllerImpl* self) -> bool {
-            using CertChainElement = chip::Credentials::OperationalCertificateStore::CertChainElement;
-
-            // Init DeviceControllerFactory
+            // Init DeviceControllerFactory — this loads the FabricTable from
+            // persistent storage (any fabric created by a previous Start).
             chip::Controller::FactoryInitParams factoryParams;
             factoryParams.systemLayer = &chip::DeviceLayer::SystemLayer();
             factoryParams.fabricIndependentStorage = &self->mStorage;
@@ -331,40 +430,6 @@ public:
                 return false;
             }
 
-            // Load credentials from KVS (stored by Bootstrap)
-            uint8_t rcacBuf[chip::Controller::kMaxCHIPDERCertLength];
-            chip::MutableByteSpan rcacSpan(rcacBuf);
-            if (self->mOpCertStore.GetCertificate(self->kFabricIndex, CertChainElement::kRcac, rcacSpan) != CHIP_NO_ERROR) {
-                _LOG_ERROR("Failed to load RCAC from KVS — bootstrap required");
-                return false;
-            }
-
-            uint8_t icacBuf[chip::Controller::kMaxCHIPDERCertLength];
-            chip::MutableByteSpan icacSpan(icacBuf);
-            if (self->mOpCertStore.GetCertificate(self->kFabricIndex, CertChainElement::kIcac, icacSpan) != CHIP_NO_ERROR) {
-                _LOG_ERROR("Failed to load ICAC from KVS — bootstrap required");
-                return false;
-            }
-
-            uint8_t nocBuf[chip::Controller::kMaxCHIPDERCertLength];
-            chip::MutableByteSpan nocSpan(nocBuf);
-            if (self->mOpCertStore.GetCertificate(self->kFabricIndex, CertChainElement::kNoc, nocSpan) != CHIP_NO_ERROR) {
-                _LOG_ERROR("Failed to load NOC from KVS — bootstrap required");
-                return false;
-            }
-
-            // Extract and validate fabricId from RCAC
-            chip::FabricId fabricId = chip::kUndefinedFabricId;
-            CHIP_ERROR extractErr = chip::Credentials::ExtractFabricIdFromCert(rcacSpan, &fabricId);
-            if (extractErr != CHIP_NO_ERROR || fabricId == chip::kUndefinedFabricId) {
-                _LOG_ERROR("Failed to extract fabricId from RCAC: %s", chip::ErrorStr(extractErr));
-                return false;
-            }
-
-            _LOG_INFO("Loaded credentials from KVS: RCAC=%zu, ICAC=%zu, NOC=%zu, fabricId=%llu",
-                      rcacSpan.size(), icacSpan.size(), nocSpan.size(), (unsigned long long)fabricId);
-
-            // Setup commissioner with loaded credentials
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
             if (self->mOpCredsIssuer.Initialize(self->mStorage) != CHIP_NO_ERROR) {
@@ -376,13 +441,43 @@ public:
             chip::Controller::SetupParams setupParams;
             setupParams.pairingDelegate = self;
             setupParams.operationalCredentialsDelegate = &self->mOpCredsIssuer;
-            setupParams.controllerRCAC = rcacSpan;
-            setupParams.controllerICAC = icacSpan;
-            setupParams.controllerNOC = nocSpan;
             setupParams.enableServerInteractions = true;
             setupParams.controllerVendorId = chip::VendorId::TestVendor1;
             setupParams.deviceAttestationVerifier = self->mTestVerifier.get();
             setupParams.defaultCommissioner = &self->mAutoCommissioner;
+
+            // Check if FabricTable already has our fabric (from a previous
+            // successful Start). If so, reference it by index. Otherwise,
+            // load raw X.509 DER certs from our custom KVS keys and let
+            // SetupCommissioner create the fabric from scratch.
+            const auto * fabricTable = chip::Controller::DeviceControllerFactory::GetInstance().GetSystemState()->Fabrics();
+            const auto * fabricInfo = (fabricTable != nullptr) ? fabricTable->FindFabricWithIndex(self->kFabricIndex) : nullptr;
+
+            if (fabricInfo != nullptr) {
+                _LOG_INFO("Using existing fabric at index %u", static_cast<unsigned>(self->kFabricIndex));
+                setupParams.fabricIndex.SetValue(self->kFabricIndex);
+            } else {
+                _LOG_INFO("No existing fabric — loading bootstrap certs from KVS");
+
+                // Load raw X.509 DER certs from our custom KVS keys
+                uint8_t rcacBuf[chip::Controller::kMaxCHIPDERCertLength];
+                uint8_t icacBuf[chip::Controller::kMaxCHIPDERCertLength];
+                uint8_t nocBuf[chip::Controller::kMaxCHIPDERCertLength];
+                uint16_t rcacSize = sizeof(rcacBuf), icacSize = sizeof(icacBuf), nocSize = sizeof(nocBuf);
+
+                if (self->mStorage.SyncGetKeyValue(self->kRcacStorageKey, rcacBuf, rcacSize) != CHIP_NO_ERROR ||
+                    self->mStorage.SyncGetKeyValue(self->kIcacStorageKey, icacBuf, icacSize) != CHIP_NO_ERROR ||
+                    self->mStorage.SyncGetKeyValue(self->kNocStorageKey,  nocBuf,  nocSize)  != CHIP_NO_ERROR) {
+                    _LOG_ERROR("Failed to load bootstrap certs from KVS");
+                    return false;
+                }
+
+                _LOG_INFO("Loaded bootstrap certs: RCAC=%u, ICAC=%u, NOC=%u", rcacSize, icacSize, nocSize);
+
+                setupParams.controllerRCAC = chip::ByteSpan(rcacBuf, rcacSize);
+                setupParams.controllerICAC = chip::ByteSpan(icacBuf, icacSize);
+                setupParams.controllerNOC  = chip::ByteSpan(nocBuf, nocSize);
+            }
 
             CHIP_ERROR err = chip::Controller::DeviceControllerFactory::GetInstance().SetupCommissioner(setupParams, self->mCommissioner);
             if (err != CHIP_NO_ERROR) {
@@ -390,7 +485,7 @@ public:
                 return false;
             }
 
-            _LOG_INFO("Commissioner initialized with fabricId=%llu", (unsigned long long)fabricId);
+            _LOG_INFO("Commissioner initialized on fabric index %d", self->mCommissioner.GetFabricIndex());
 
             // Load IPK from KVS (stored by Bootstrap)
             uint8_t ipkBuf[chip::Crypto::CHIP_CRYPTO_SYMMETRIC_KEY_LENGTH_BYTES];
@@ -523,7 +618,39 @@ public:
         return ParseSubscribe(nodeId, endpointId, clusterId, matterPayload);
     }
 
+    /**
+     * Complete a pending commissioning attempt — cancels the watchdog timer and
+     * fires the agw_matter_commission_complete_handler callback.
+     * Must be called on the CHIP thread (timer callback / delegate callback).
+     */
+    void CompleteCommissioning(chip::NodeId nodeId, bool success, const char *error) {
+        if (!mCommissioningInProgress.exchange(false))
+            return; /* already completed / timed out */
+
+        chip::DeviceLayer::SystemLayer().CancelTimer(OnCommissioningTimeout, this);
+
+        _LOG_INFO("Commissioning result for node %llu: %s%s%s",
+                  (unsigned long long)nodeId,
+                  success ? "success" : "failed",
+                  error ? " — " : "", error ? error : "");
+
+        agw_matter_commission_complete_handler(nodeId, success, error);
+    }
+
+    static void OnCommissioningTimeout(chip::System::Layer *, void *appState) {
+        auto *self = static_cast<MatterControllerImpl *>(appState);
+        chip::NodeId nodeId = self->mCommissioningNodeId;
+
+        _LOG_ERROR("Commissioning timeout for node %llu — no completion callback received",
+                   (unsigned long long)nodeId);
+
+        self->CompleteCommissioning(nodeId, false, "Commissioning timeout");
+    }
+
     bool CommissionDevice(uint64_t nodeId, const char* payload, const char* ssid, const char* password) {
+        mCommissioningNodeId = static_cast<chip::NodeId>(nodeId);
+        mCommissioningInProgress = true;
+
         struct CommissionContext {
             MatterControllerImpl* controller;
             chip::NodeId nodeId;
@@ -537,6 +664,11 @@ public:
 
         chip::DeviceLayer::PlatformMgr().ScheduleWork([](intptr_t arg) {
             auto* ctx = reinterpret_cast<CommissionContext*>(arg);
+
+            /* Start the watchdog timer before PairDevice */
+            chip::DeviceLayer::SystemLayer().StartTimer(
+                chip::System::Clock::Milliseconds32(kCommissionTimeoutMs),
+                OnCommissioningTimeout, ctx->controller);
 
             if (!ctx->ssid.empty() && !ctx->password.empty()) {
                 chip::Controller::CommissioningParameters params;
@@ -619,10 +751,12 @@ public:
     }
 
     void OnPairingComplete(CHIP_ERROR error) override {
-        if (error != CHIP_NO_ERROR)
+        if (error != CHIP_NO_ERROR) {
             _LOG_ERROR("Pairing Failed: %s", chip::ErrorStr(error));
-        else
+            CompleteCommissioning(mCommissioningNodeId, false, chip::ErrorStr(error));
+        } else {
             _LOG_INFO("Pairing Complete");
+        }
     }
 
     void OnCommissioningStatusUpdate(chip::PeerId peerId, chip::Controller::CommissioningStage stageCompleted, CHIP_ERROR error) override {
@@ -632,13 +766,27 @@ public:
     void OnCommissioningFailure(chip::PeerId peerId, CHIP_ERROR error, chip::Controller::CommissioningStage stageFailed,
                                 chip::Optional<chip::Credentials::AttestationVerificationResult> additionalErrorInfo) override {
         _LOG_ERROR("Commissioning failed at stage '%s': %s", chip::Controller::StageToString(stageFailed), chip::ErrorStr(error));
+        CompleteCommissioning(mCommissioningNodeId, false, chip::ErrorStr(error));
     }
 
     void OnCommissioningComplete(chip::NodeId nodeId, CHIP_ERROR error) override {
-        if (error != CHIP_NO_ERROR)
+        if (error != CHIP_NO_ERROR) {
             _LOG_ERROR("Commissioning Failed: %s", chip::ErrorStr(error));
-        else
-            _LOG_INFO("Commissioning Complete for NodeId: %llu", (unsigned long long)nodeId);
+            CompleteCommissioning(nodeId, false, chip::ErrorStr(error));
+            return;
+        }
+
+        _LOG_INFO("Commissioning Complete for NodeId: %llu", (unsigned long long)nodeId);
+
+        /* Build minimal deviceInfo and fire announce callback.
+         * Full interrogation (Basic Info / Descriptor reads) is added in Chunk 5. */
+        json_t *deviceInfo = json_pack("{s:I}", "nodeId", (json_int_t)nodeId);
+        if (deviceInfo) {
+            agw_matter_device_announce_handler(nodeId, deviceInfo);
+            json_decref(deviceInfo);
+        }
+
+        CompleteCommissioning(nodeId, true, NULL);
     }
 
 private:
@@ -795,11 +943,19 @@ private:
         return true;
     }
 
-    static constexpr const char * kIpkStorageKey = "agw/matter/ipk";
+    // Custom KVS keys for bootstrap credential storage.
+    // These are OUR keys — separate from the CHIP SDK's cert store keys.
+    // SetupCommissioner manages the cert store; we just cache raw certs here.
+    static constexpr const char * kIpkStorageKey  = "agw/matter/ipk";
+    static constexpr const char * kRcacStorageKey = "agw/matter/rcac";
+    static constexpr const char * kIcacStorageKey = "agw/matter/icac";
+    static constexpr const char * kNocStorageKey  = "agw/matter/noc";
     static constexpr chip::FabricIndex kFabricIndex = 1;
 
     std::atomic<bool> mInitialized;
     std::atomic<bool> mRunning;
+    chip::NodeId mCommissioningNodeId;
+    std::atomic<bool> mCommissioningInProgress;
     chip::Controller::DeviceCommissioner mCommissioner;
     chip::Controller::AutoCommissioner mAutoCommissioner;
     chip::Controller::ExampleOperationalCredentialsIssuer mOpCredsIssuer;
@@ -824,6 +980,9 @@ MatterController::~MatterController() = default;
 
 bool MatterController::Init(log_levels_t level) { return mImpl->Init(level); }
 bool MatterController::IsBootstrapRequired() { return mImpl->IsBootstrapRequired(); }
+bool MatterController::GenerateBootstrapCsr(const char *csr_nonce, char **csr_pem, char **nocsr_elements) {
+    return mImpl->GenerateBootstrapCsr(csr_nonce, csr_pem, nocsr_elements);
+}
 bool MatterController::Bootstrap(const uint8_t *rcac, size_t rcac_len,
                                  const uint8_t *icac, size_t icac_len,
                                  const uint8_t *ipk, size_t ipk_len,
