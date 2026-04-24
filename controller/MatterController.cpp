@@ -122,10 +122,13 @@ public:
     bool IsRunning() const { return mRunning; }
 
     // Run a callable on the CHIP event loop thread and block until it returns.
+    // MUST NOT be called from the CHIP thread — will deadlock.
     // Usage: auto result = RunOnChipThread([](MatterControllerImpl* self) { return true; });
     template <typename Func>
     auto RunOnChipThread(Func&& fn) -> decltype(fn(std::declval<MatterControllerImpl*>())) {
         using ReturnType = decltype(fn(std::declval<MatterControllerImpl*>()));
+
+        VerifyOrDie(!chip::DeviceLayer::PlatformMgr().IsChipStackLockedByCurrentThread());
 
         struct Context {
             MatterControllerImpl* self;
@@ -305,7 +308,12 @@ public:
             int offset = snprintf(pemOut, pemMaxLen, "-----BEGIN CERTIFICATE REQUEST-----\n");
             for (uint16_t i = 0; i < b64Written; i += 64) {
                 int lineLen = (b64Written - i > 64) ? 64 : (b64Written - i);
-                if (offset + lineLen + 1 >= pemMaxLen) break;
+                if (offset + lineLen + 1 >= pemMaxLen) {
+                    _LOG_ERROR("GenerateBootstrapCsr: PEM buffer overflow");
+                    free(pemOut);
+                    self->mOpKeystore.RevertPendingKeypair();
+                    return false;
+                }
                 memcpy(pemOut + offset, b64Tmp.data() + i, lineLen);
                 offset += lineLen;
                 pemOut[offset++] = '\n';
