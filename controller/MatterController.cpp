@@ -295,7 +295,13 @@ public:
                 return false;
             }
 
-            char b64Tmp[512];
+            char *b64Tmp = static_cast<char *>(malloc(csrB64Len + 1));
+            if (!b64Tmp) {
+                _LOG_ERROR("GenerateBootstrapCsr: out of memory (b64)");
+                free(pemOut);
+                self->mOpKeystore.RevertPendingKeypair();
+                return false;
+            }
             uint16_t b64Written = chip::Base64Encode(csrSpan.data(),
                                                      static_cast<uint16_t>(csrSpan.size()),
                                                      b64Tmp);
@@ -311,6 +317,7 @@ public:
             }
             offset += snprintf(pemOut + offset, pemMaxLen - offset, "-----END CERTIFICATE REQUEST-----\n");
             pemOut[offset] = '\0';
+            free(b64Tmp);
             *csr_pem = pemOut;
 
             _LOG_INFO("GenerateBootstrapCsr: PEM CSR built (%d bytes)", offset);
