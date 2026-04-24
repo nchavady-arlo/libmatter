@@ -295,29 +295,23 @@ public:
                 return false;
             }
 
-            char *b64Tmp = static_cast<char *>(malloc(csrB64Len + 1));
-            if (!b64Tmp) {
-                _LOG_ERROR("GenerateBootstrapCsr: out of memory (b64)");
-                free(pemOut);
-                self->mOpKeystore.RevertPendingKeypair();
-                return false;
-            }
+            std::vector<char> b64Tmp(csrB64Len + 1);
             uint16_t b64Written = chip::Base64Encode(csrSpan.data(),
                                                      static_cast<uint16_t>(csrSpan.size()),
-                                                     b64Tmp);
+                                                     b64Tmp.data());
             b64Tmp[b64Written] = '\0';
 
             // Build PEM with 64-char line wrapping
             int offset = snprintf(pemOut, pemMaxLen, "-----BEGIN CERTIFICATE REQUEST-----\n");
             for (uint16_t i = 0; i < b64Written; i += 64) {
                 int lineLen = (b64Written - i > 64) ? 64 : (b64Written - i);
-                memcpy(pemOut + offset, b64Tmp + i, lineLen);
+                if (offset + lineLen + 1 >= pemMaxLen) break;
+                memcpy(pemOut + offset, b64Tmp.data() + i, lineLen);
                 offset += lineLen;
                 pemOut[offset++] = '\n';
             }
             offset += snprintf(pemOut + offset, pemMaxLen - offset, "-----END CERTIFICATE REQUEST-----\n");
             pemOut[offset] = '\0';
-            free(b64Tmp);
             *csr_pem = pemOut;
 
             _LOG_INFO("GenerateBootstrapCsr: PEM CSR built (%d bytes)", offset);
@@ -626,8 +620,7 @@ public:
     }
 
     /**
-     * Complete a pending commissioning attempt — cancels the watchdog timer and
-     * fires the agw_matter_commission_complete_handler callback.
+     * Complete a pending commissioning attempt — cancels the watchdog timer.
      * Must be called on the CHIP thread (timer callback / delegate callback).
      */
     void CompleteCommissioning(chip::NodeId nodeId, bool success, const char *error) {
@@ -640,8 +633,6 @@ public:
                   (unsigned long long)nodeId,
                   success ? "success" : "failed",
                   error ? " — " : "", error ? error : "");
-
-        agw_matter_commission_complete_handler(nodeId, success, error);
     }
 
     static void OnCommissioningTimeout(chip::System::Layer *, void *appState) {
