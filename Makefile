@@ -57,10 +57,7 @@ $(OBJDIR)/%.o: controller/%.cpp
 install: $(OBJDIR)/$(TARGET_LIB)
 	$(INSTALL) -D -m0755 $(OBJDIR)/$(TARGET_LIB) $(DESTDIR)/usr/lib/$(TARGET_LIB)
 
-install-staging: $(OBJDIR)/$(TARGET_LIB)
-	$(INSTALL) -D -m0755 $(OBJDIR)/$(TARGET_LIB) $(STAGING_DIR)/usr/lib/$(TARGET_LIB)
-
 clean:
 	-rm -f $(OBJDIR)/*.o $(OBJDIR)/$(TARGET_LIB)
 
-.PHONY: all install install-staging clean
+.PHONY: all install clean
