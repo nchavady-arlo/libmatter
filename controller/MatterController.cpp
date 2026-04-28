@@ -305,9 +305,9 @@ public:
             b64Tmp[b64Written] = '\0';
 
             // Build PEM with 64-char line wrapping
-            int offset = snprintf(pemOut, pemMaxLen, "-----BEGIN CERTIFICATE REQUEST-----\n");
+            size_t offset = snprintf(pemOut, pemMaxLen, "-----BEGIN CERTIFICATE REQUEST-----\n");
             for (uint16_t i = 0; i < b64Written; i += 64) {
-                int lineLen = (b64Written - i > 64) ? 64 : (b64Written - i);
+                size_t lineLen = (b64Written - i > 64) ? 64 : (b64Written - i);
                 if (offset + lineLen + 1 >= pemMaxLen) {
                     _LOG_ERROR("GenerateBootstrapCsr: PEM buffer overflow");
                     free(pemOut);
@@ -322,7 +322,7 @@ public:
             pemOut[offset] = '\0';
             *csr_pem = pemOut;
 
-            _LOG_INFO("GenerateBootstrapCsr: PEM CSR built (%d bytes)", offset);
+            _LOG_INFO("GenerateBootstrapCsr: PEM CSR built (%zu bytes)", offset);
 
             // Construct NOCSRElements TLV: {csr, csrNonce, vendor_reserved...}
             uint8_t nocsrBuf[chip::Credentials::kMaxRspLen];
