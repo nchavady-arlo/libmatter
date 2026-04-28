@@ -2,7 +2,7 @@
  *  @file       MatterCommand.cpp
  *  @author     Noel Chavady <nchavady@arlo.com>
  *
- * Copyright (c) 2025, Arlo Technologies, Inc.
+ * Copyright (c) 2026, Arlo Technologies, Inc.
  * All rights reserved.
  *
  * This software is the confidential and proprietary information of
