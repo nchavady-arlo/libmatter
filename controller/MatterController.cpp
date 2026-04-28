@@ -305,7 +305,14 @@ public:
             b64Tmp[b64Written] = '\0';
 
             // Build PEM with 64-char line wrapping
-            size_t offset = snprintf(pemOut, pemMaxLen, "-----BEGIN CERTIFICATE REQUEST-----\n");
+            int ret = snprintf(pemOut, pemMaxLen, "-----BEGIN CERTIFICATE REQUEST-----\n");
+            if (ret < 0 || (size_t)ret >= pemMaxLen) {
+                _LOG_ERROR("GenerateBootstrapCsr: PEM header write failed");
+                free(pemOut);
+                self->mOpKeystore.RevertPendingKeypair();
+                return false;
+            }
+            size_t offset = (size_t)ret;
             for (uint16_t i = 0; i < b64Written; i += 64) {
                 size_t lineLen = (b64Written - i > 64) ? 64 : (b64Written - i);
                 if (offset + lineLen + 1 >= pemMaxLen) {
@@ -318,7 +325,14 @@ public:
                 offset += lineLen;
                 pemOut[offset++] = '\n';
             }
-            offset += snprintf(pemOut + offset, pemMaxLen - offset, "-----END CERTIFICATE REQUEST-----\n");
+            ret = snprintf(pemOut + offset, pemMaxLen - offset, "-----END CERTIFICATE REQUEST-----\n");
+            if (ret < 0 || offset + (size_t)ret >= pemMaxLen) {
+                _LOG_ERROR("GenerateBootstrapCsr: PEM footer write failed");
+                free(pemOut);
+                self->mOpKeystore.RevertPendingKeypair();
+                return false;
+            }
+            offset += (size_t)ret;
             pemOut[offset] = '\0';
             *csr_pem = pemOut;
 
