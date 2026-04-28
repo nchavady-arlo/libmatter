@@ -23,7 +23,8 @@ SRCS := \
 	controller/MatterCommand.cpp \
 	controller/MatterSubscribe.cpp \
 	controller/MatterPublish.cpp \
-	controller/MinimalDataModelProvider.cpp
+	controller/MinimalDataModelProvider.cpp \
+	controller/agw_matter_api.cpp
 
 OBJS := $(addprefix $(OBJDIR)/, $(notdir $(SRCS:.cpp=.o)))
 
@@ -55,11 +56,9 @@ $(OBJDIR)/%.o: controller/%.cpp
 
 install: $(OBJDIR)/$(TARGET_LIB)
 	$(INSTALL) -D -m0755 $(OBJDIR)/$(TARGET_LIB) $(DESTDIR)/usr/lib/$(TARGET_LIB)
-	$(INSTALL) -D -m0644 controller/matter_interface.h $(DESTDIR)/usr/include/matter_interface.h
 
 install-staging: $(OBJDIR)/$(TARGET_LIB)
 	$(INSTALL) -D -m0755 $(OBJDIR)/$(TARGET_LIB) $(STAGING_DIR)/usr/lib/$(TARGET_LIB)
-	$(INSTALL) -D -m0644 controller/matter_interface.h $(STAGING_DIR)/usr/include/matter_interface.h
 
 clean:
 	-rm -f $(OBJDIR)/*.o $(OBJDIR)/$(TARGET_LIB)
