@@ -25,22 +25,19 @@
 MatterSubscribe::MatterSubscribe(
     chip::Controller::DeviceCommissioner* commissioner,
     chip::NodeId nodeId,
-    chip::EndpointId endpointId,
-    chip::ClusterId clusterId,
     chip::app::InteractionModelEngine* imEngine,
-    uint16_t minInterval,
-    uint16_t maxInterval,
+    uint16_t minSubscriptionInt,
+    uint16_t maxSubscriptionInt,
     chip::ScopedNodeId peerId,
     chip::app::AttributePathParams* attrPaths,
     size_t numAttr,
     chip::app::EventPathParams* evPaths,
     size_t numEv)
     : MatterOperation(commissioner, nodeId),
-      mImEngine(imEngine), mEndpointId(endpointId), mClusterId(clusterId),
-      mMinInterval(minInterval), mMaxInterval(maxInterval), mPeerId(peerId),
+      mImEngine(imEngine), mMinSubscriptionInt(minSubscriptionInt), mMaxSubscriptionInt(maxSubscriptionInt), mPeerId(peerId),
       mAttrPaths(attrPaths), mNumAttr(numAttr),
       mEvPaths(evPaths), mNumEv(numEv),
-      mCallback(std::make_unique<MatterSubscribeCallback>(this, nodeId, endpointId, clusterId))
+      mCallback(std::make_unique<MatterSubscribeCallback>(this, nodeId))
 {
 }
 
@@ -66,8 +63,8 @@ void MatterSubscribe::OnDeviceConnected(chip::Messaging::ExchangeManager& exchan
     }
 
     chip::app::ReadPrepareParams params;
-    params.mMinIntervalFloorSeconds = mMinInterval;
-    params.mMaxIntervalCeilingSeconds = mMaxInterval;
+    params.mMinIntervalFloorSeconds = mMinSubscriptionInt;
+    params.mMaxIntervalCeilingSeconds = mMaxSubscriptionInt;
     params.mpAttributePathParamsList = mAttrPaths;
     params.mAttributePathParamsListSize = mNumAttr;
     params.mpEventPathParamsList = mEvPaths;
@@ -91,26 +88,22 @@ void MatterSubscribe::OnDeviceConnected(chip::Messaging::ExchangeManager& exchan
 
 // --- MatterSubscribeCallback ---
 
-MatterSubscribeCallback::MatterSubscribeCallback(MatterSubscribe* requestCtx, chip::NodeId nodeId,
-                                     chip::EndpointId endpointId, chip::ClusterId clusterId)
-    : mSubscribe(requestCtx), mNodeId(nodeId), mEndpointId(endpointId), mClusterId(clusterId)
+MatterSubscribeCallback::MatterSubscribeCallback(MatterSubscribe* subscribe, chip::NodeId nodeId)
+    : mSubscribe(subscribe), mNodeId(nodeId)
 {
-    mAttributeArray = json_array();
-    mEventArray = json_array();
 }
 
 MatterSubscribeCallback::~MatterSubscribeCallback()
 {
-    if (mAttributeArray)
-        json_decref(mAttributeArray);
-    if (mEventArray)
-        json_decref(mEventArray);
+    for (auto& [key, arr] : mAttributeReports)
+        json_decref(arr);
+    for (auto& [key, arr] : mEventReports)
+        json_decref(arr);
 }
 
 void MatterSubscribeCallback::Shutdown()
 {
-    _LOG_INFO("Subscribe: shutting down node=%llu ep=%u cluster=0x%04x",
-              (unsigned long long)mNodeId, mEndpointId, mClusterId);
+    _LOG_INFO("Subscribe: shutting down node=%llu", (unsigned long long)mNodeId);
     mDoneCallback = nullptr;
     if (mReadClient) {
         chip::Platform::Delete(mReadClient);
@@ -129,36 +122,30 @@ void MatterSubscribeCallback::OnSubscriptionEstablished(chip::SubscriptionId aSu
 }
 
 void MatterSubscribeCallback::OnAttributeData(const chip::app::ConcreteDataAttributePath& aPath, chip::TLV::TLVReader* apData,
-                                         const chip::app::StatusIB& aStatus)
+                                               const chip::app::StatusIB& aStatus)
 {
-    _LOG_DEBUG("Subscribe: attribute node=%llu ep=%u cluster=0x%04x attr=0x%04x status=%u",
-               (unsigned long long)mNodeId, aPath.mEndpointId, aPath.mClusterId, aPath.mAttributeId,
-               static_cast<unsigned>(aStatus.mStatus));
-    json_array_append_new(mAttributeArray,
+    ClusterKey key(aPath.mEndpointId, aPath.mClusterId);
+    json_t* arr = GetOrCreateArray(mAttributeReports, key);
+    json_array_append_new(arr,
         MatterJsonUtils::BuildAttributeEntry(aPath.mAttributeId, apData, static_cast<int>(aStatus.mStatus)));
 }
 
 void MatterSubscribeCallback::OnReportEnd()
 {
     _LOG_DEBUG("Subscribe: report end node=%llu attrs=%zu events=%zu",
-               (unsigned long long)mNodeId, json_array_size(mAttributeArray), json_array_size(mEventArray));
-    if (json_array_size(mAttributeArray)) {
-        MatterPublish::AttributeUpdate(mNodeId, mEndpointId, mClusterId, mAttributeArray);
-        mAttributeArray = json_array();
-    }
-    if (json_array_size(mEventArray)) {
-        MatterPublish::EventUpdate(mNodeId, mEndpointId, mClusterId, mEventArray);
-        mEventArray = json_array();
-    }
+               (unsigned long long)mNodeId, mAttributeReports.size(), mEventReports.size());
+    FlushReports();
 }
 
 void MatterSubscribeCallback::OnEventData(const chip::app::EventHeader& aEventHeader, chip::TLV::TLVReader* apData,
-                                     const chip::app::StatusIB* apStatus)
+                                           const chip::app::StatusIB* apStatus)
 {
     _LOG_DEBUG("Subscribe: event node=%llu ep=%u cluster=0x%04x event=0x%04x",
                (unsigned long long)mNodeId, aEventHeader.mPath.mEndpointId, aEventHeader.mPath.mClusterId,
                aEventHeader.mPath.mEventId);
-    json_array_append_new(mEventArray,
+    ClusterKey key(aEventHeader.mPath.mEndpointId, aEventHeader.mPath.mClusterId);
+    json_t* arr = GetOrCreateArray(mEventReports, key);
+    json_array_append_new(arr,
         MatterJsonUtils::BuildEventEntry(aEventHeader.mPath.mEventId, apData,
             apStatus ? static_cast<int>(apStatus->mStatus) : 0));
 }
@@ -175,8 +162,7 @@ void MatterSubscribeCallback::OnError(CHIP_ERROR aError)
 
 void MatterSubscribeCallback::OnDone(chip::app::ReadClient* apReadClient)
 {
-    _LOG_INFO("Subscribe: done (subscription ended) node=%llu ep=%u cluster=0x%04x",
-              (unsigned long long)mNodeId, mEndpointId, mClusterId);
+    _LOG_INFO("Subscribe: done (subscription ended) node=%llu", (unsigned long long)mNodeId);
     mReadClient = nullptr;
     if (apReadClient)
         chip::Platform::Delete(apReadClient);
@@ -200,4 +186,37 @@ void MatterSubscribeCallback::OnDeallocatePaths(chip::app::ReadPrepareParams&& a
         chip::Platform::MemoryFree(aReadPrepareParams.mpEventPathParamsList);
         aReadPrepareParams.mpEventPathParamsList = nullptr;
     }
+}
+
+json_t* MatterSubscribeCallback::GetOrCreateArray(std::map<ClusterKey, json_t*>& map, ClusterKey key)
+{
+    auto it = map.find(key);
+    if (it != map.end())
+        return it->second;
+    json_t* arr = json_array();
+    map[key] = arr;
+    return arr;
+}
+
+void MatterSubscribeCallback::FlushReports()
+{
+    for (auto& [key, arr] : mAttributeReports) {
+        if (json_array_size(arr) > 0) {
+            // AttributeUpdate steals the json reference via json_pack "s:o"
+            MatterPublish::AttributeUpdate(mNodeId, key.first, key.second, arr);
+        } else {
+            json_decref(arr);
+        }
+    }
+    mAttributeReports.clear();
+
+    for (auto& [key, arr] : mEventReports) {
+        if (json_array_size(arr) > 0) {
+            // EventUpdate steals the json reference via json_pack "s:o"
+            MatterPublish::EventUpdate(mNodeId, key.first, key.second, arr);
+        } else {
+            json_decref(arr);
+        }
+    }
+    mEventReports.clear();
 }

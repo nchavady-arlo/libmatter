@@ -17,9 +17,31 @@
 
 #include <stdint.h>
 #include <jansson.h>
+#include <map>
+#include <string>
+#include <vector>
+
+struct EndpointDescriptor {
+    std::vector<uint32_t> deviceTypes;
+    std::vector<uint32_t> serverClusters;
+    std::vector<uint32_t> clientClusters;
+};
+
+struct DeviceInfo {
+    uint64_t nodeId = 0;
+    std::string vendorName;
+    uint32_t vendorId = 0;
+    std::string productName;
+    uint32_t productId = 0;
+    uint32_t hwVersion = 0;
+    std::string swVersionString;
+    std::string serialNumber;
+    std::map<uint16_t, EndpointDescriptor> endpoints;
+};
 
 namespace MatterPublish {
 
+void DeviceAnnounce(const DeviceInfo& info);
 void AttributeUpdate(uint64_t nodeId, uint16_t endpointId, uint32_t clusterId, json_t* attributes);
 void EventUpdate(uint64_t nodeId, uint16_t endpointId, uint32_t clusterId, json_t* events);
 

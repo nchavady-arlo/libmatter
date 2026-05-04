@@ -21,6 +21,7 @@
 #include <app/InteractionModelEngine.h>
 #include <jansson.h>
 #include <functional>
+#include <map>
 #include <memory>
 
 class MatterSubscribe;
@@ -31,8 +32,7 @@ public:
     typedef std::unique_ptr<MatterSubscribeCallback> Ptr;
     typedef std::function<void()> DoneCallback;
 
-    MatterSubscribeCallback(MatterSubscribe* subscribe, chip::NodeId nodeId,
-                            chip::EndpointId endpointId, chip::ClusterId clusterId);
+    MatterSubscribeCallback(MatterSubscribe* subscribe, chip::NodeId nodeId);
     ~MatterSubscribeCallback();
 
     void SetDoneCallback(DoneCallback cb) { mDoneCallback = std::move(cb); }
@@ -52,12 +52,15 @@ public:
     void OnDeallocatePaths(chip::app::ReadPrepareParams&& aReadPrepareParams) override;
 
 private:
+    typedef std::pair<chip::EndpointId, chip::ClusterId> ClusterKey;
+
+    json_t* GetOrCreateArray(std::map<ClusterKey, json_t*>& map, ClusterKey key);
+    void FlushReports();
+
     MatterSubscribe* mSubscribe;
     chip::NodeId mNodeId;
-    chip::EndpointId mEndpointId;
-    chip::ClusterId mClusterId;
-    json_t* mAttributeArray;
-    json_t* mEventArray;
+    std::map<ClusterKey, json_t*> mAttributeReports;
+    std::map<ClusterKey, json_t*> mEventReports;
     DoneCallback mDoneCallback;
     chip::app::ReadClient* mReadClient = nullptr;
     chip::SubscriptionId mSubscriptionId = 0;
@@ -68,11 +71,9 @@ public:
     typedef std::shared_ptr<MatterSubscribe> Ptr;
     MatterSubscribe(chip::Controller::DeviceCommissioner* commissioner,
                     chip::NodeId nodeId,
-                    chip::EndpointId endpointId,
-                    chip::ClusterId clusterId,
                     chip::app::InteractionModelEngine* imEngine,
-                    uint16_t minInterval,
-                    uint16_t maxInterval,
+                    uint16_t minSubscriptionInt,
+                    uint16_t maxSubscriptionInt,
                     chip::ScopedNodeId peerId,
                     chip::app::AttributePathParams* attrPaths,
                     size_t numAttr,
@@ -90,10 +91,8 @@ protected:
 
 private:
     chip::app::InteractionModelEngine* mImEngine;
-    chip::EndpointId mEndpointId;
-    chip::ClusterId mClusterId;
-    uint16_t mMinInterval;
-    uint16_t mMaxInterval;
+    uint16_t mMinSubscriptionInt;
+    uint16_t mMaxSubscriptionInt;
     chip::ScopedNodeId mPeerId;
     chip::app::AttributePathParams* mAttrPaths;
     size_t mNumAttr;

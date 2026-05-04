@@ -18,6 +18,7 @@
 #include "MatterCommand.h"
 #include "MatterSession.h"
 #include "MatterSubscribe.h"
+#include "MatterDiscovery.h"
 #include "devif/agw_matter_api.h"
 #include <platform/CHIPDeviceLayer.h>
 #include <platform/ConnectivityManager.h>
@@ -573,30 +574,28 @@ public:
         _LOG_INFO("Matter controller stopped.");
     }
 
-    bool DeviceCommand(const std::string& actionStr, json_t* matterPayload) {
+    bool DeviceCommand(uint64_t nodeId, json_t* matterPayload) {
         if (!mRunning) {
             MatterError::SetResult(matterPayload, MatterErrorCode::kCommandFailed);
             return false;
         }
 
-        json_int_t nodeIdVal = 0, endpointVal = 0, clusterIdVal = 0;
-        if (json_unpack(matterPayload, "{s:{s:I,s:I,s:I}}",
+        json_int_t endpointVal = 0, clusterIdVal = 0;
+        if (json_unpack(matterPayload, "{s:{s:I,s:I}}",
                                        "meta",
-                                       "nodeId", &nodeIdVal,
                                        "endpoint", &endpointVal,
                                        "clusterId", &clusterIdVal) != 0) {
             MatterError::SetResult(matterPayload, MatterErrorCode::kInvalidParams);
             return false;
         }
 
-        chip::NodeId nodeId       = static_cast<chip::NodeId>(nodeIdVal);
         chip::EndpointId endpointId = static_cast<chip::EndpointId>(endpointVal);
         chip::ClusterId clusterId = static_cast<chip::ClusterId>(clusterIdVal);
 
-        return ParseCommand(nodeId, endpointId, clusterId, matterPayload);
+        return ParseCommand(static_cast<chip::NodeId>(nodeId), endpointId, clusterId, matterPayload);
     }
 
-    bool DeviceRead(const std::string& actionStr, json_t* matterPayload) {
+    bool DeviceRead(uint64_t nodeId, json_t* matterPayload) {
         if (!mRunning) {
             MatterError::SetResult(matterPayload, MatterErrorCode::kCommandFailed);
             return false;
@@ -607,7 +606,7 @@ public:
         return false;
     }
 
-    bool DeviceWrite(const std::string& actionStr, json_t* matterPayload) {
+    bool DeviceWrite(uint64_t nodeId, json_t* matterPayload) {
         if (!mRunning) {
             MatterError::SetResult(matterPayload, MatterErrorCode::kCommandFailed);
             return false;
@@ -618,27 +617,25 @@ public:
         return false;
     }
 
-    bool DeviceSubscribe(const std::string& actionStr, json_t* matterPayload) {
+    bool DeviceSubscribe(uint64_t nodeId, json_t* matterPayload) {
         if (!mRunning) {
             MatterError::SetResult(matterPayload, MatterErrorCode::kCommandFailed);
             return false;
         }
 
-        json_int_t nodeIdVal = 0, endpointVal = 0, clusterIdVal = 0;
-        if (json_unpack(matterPayload, "{s:{s:I,s:I,s:I}}",
+        json_int_t endpointVal = 0, clusterIdVal = 0;
+        if (json_unpack(matterPayload, "{s:{s:I,s:I}}",
                                        "meta",
-                                       "nodeId", &nodeIdVal,
                                        "endpoint", &endpointVal,
                                        "clusterId", &clusterIdVal) != 0) {
             MatterError::SetResult(matterPayload, MatterErrorCode::kInvalidParams);
             return false;
         }
 
-        chip::NodeId nodeId       = static_cast<chip::NodeId>(nodeIdVal);
         chip::EndpointId endpointId = static_cast<chip::EndpointId>(endpointVal);
         chip::ClusterId clusterId = static_cast<chip::ClusterId>(clusterIdVal);
 
-        return ParseSubscribe(nodeId, endpointId, clusterId, matterPayload);
+        return ParseSubscribe(static_cast<chip::NodeId>(nodeId), endpointId, clusterId, matterPayload);
     }
 
     /**
@@ -705,7 +702,8 @@ public:
         return true;
     }
 
-    bool EstablishCaseSessions(const std::vector<uint64_t>& nodeIds, int retryCount) {
+    bool EstablishCaseSessions(const std::vector<uint64_t>& nodeIds, int retryCount,
+                               uint16_t minSubscriptionInt, uint16_t maxSubscriptionInt) {
         if (!mRunning)
             return false;
 
@@ -718,11 +716,17 @@ public:
         threads.reserve(nodeIds.size());
 
         for (auto id : nodeIds) {
-            threads.emplace_back([this, id, retryCount]() {
+            threads.emplace_back([this, id, retryCount, minSubscriptionInt, maxSubscriptionInt]() {
                 MatterSession session(&mCommissioner, id);
-                if (!session.Connect(retryCount))
+                if (session.Connect(retryCount)) {
+                    MatterDiscovery discovery(&mCommissioner, id);
+                    if (discovery.Discover(minSubscriptionInt, maxSubscriptionInt)) {
+                        AddSubscribeCallback(id, discovery.TakeSubscription());
+                    }
+                } else {
                     _LOG_ERROR("EstablishCaseSessions: failed for node %llu after %d attempt(s)",
                                (unsigned long long)id, retryCount + 1);
+                }
             });
         }
 
@@ -765,6 +769,10 @@ public:
         mSubscribeCallbacks.emplace(key, std::move(cb));
     }
 
+    void AddSubscribeCallback(chip::NodeId nodeId, MatterSubscribeCallback::Ptr cb) {
+        AddSubscribeCallback(nodeId, chip::kInvalidEndpointId, chip::kInvalidClusterId, std::move(cb));
+    }
+
     // DevicePairingDelegate
     void OnStatusUpdate(chip::Controller::DevicePairingDelegate::Status status) override {
         _LOG_INFO("Pairing Status Update: %d", status);
@@ -800,10 +808,9 @@ public:
 
         /* Build minimal deviceInfo and fire announce callback.
          * Full interrogation (Basic Info / Descriptor reads) is added in Chunk 5. */
-        json_t *deviceInfo = json_pack("{s:I}", "nodeId", (json_int_t)nodeId);
+        json_auto_t *deviceInfo = json_pack("{s:I}", "nodeId", (json_int_t)nodeId);
         if (deviceInfo) {
             agw_matter_device_announce_handler(nodeId, deviceInfo);
-            json_decref(deviceInfo);
         }
 
         CompleteCommissioning(nodeId, true, NULL);
@@ -821,15 +828,17 @@ private:
         json_int_t commandIdVal = json_integer_value(j_command);
 
         json_t* j_commandData = json_object_get(matterPayload, "commandData");
+        if (j_commandData && json_is_object(j_commandData) && json_object_size(j_commandData) == 0)
+            j_commandData = nullptr;
         return SendCommand(nodeId, endpointId, clusterId, static_cast<uint32_t>(commandIdVal), j_commandData, matterPayload);
     }
 
     bool ParseSubscribe(chip::NodeId nodeId, chip::EndpointId endpointId, chip::ClusterId clusterId,
                         json_t* matterPayload) {
-        json_int_t minIntervalVal = 1, maxIntervalVal = 300;
-        json_unpack(matterPayload, "{s?I,s?I}", "minInterval", &minIntervalVal, "maxInterval", &maxIntervalVal);
-        uint16_t minInterval = static_cast<uint16_t>(minIntervalVal <= 0 ? 1 : (minIntervalVal > 65535 ? 65535 : minIntervalVal));
-        uint16_t maxInterval = static_cast<uint16_t>(maxIntervalVal <= 0 ? 300 : (maxIntervalVal > 65535 ? 65535 : maxIntervalVal));
+        json_int_t minSubIntVal = 1, maxSubIntVal = 300;
+        json_unpack(matterPayload, "{s?I,s?I}", "minInterval", &minSubIntVal, "maxInterval", &maxSubIntVal);
+        uint16_t minSubscriptionInt = static_cast<uint16_t>(minSubIntVal <= 0 ? 1 : (minSubIntVal > 65535 ? 65535 : minSubIntVal));
+        uint16_t maxSubscriptionInt = static_cast<uint16_t>(maxSubIntVal <= 0 ? 300 : (maxSubIntVal > 65535 ? 65535 : maxSubIntVal));
 
         std::vector<uint32_t> attributeIds;
         std::vector<uint32_t> eventIds;
@@ -853,7 +862,7 @@ private:
                     eventIds.push_back(static_cast<uint32_t>(json_integer_value(json_elem)));
             }
         }
-        return Subscribe(nodeId, endpointId, clusterId, minInterval, maxInterval, attributeIds, eventIds, matterPayload);
+        return Subscribe(nodeId, endpointId, clusterId, minSubscriptionInt, maxSubscriptionInt, attributeIds, eventIds, matterPayload);
     }
 
     bool SendCommand(chip::NodeId nodeId, chip::EndpointId endpointId, chip::ClusterId clusterId,
@@ -887,7 +896,7 @@ private:
     }
 
     bool Subscribe(chip::NodeId nodeId, chip::EndpointId endpointId, chip::ClusterId clusterId,
-                   uint16_t minInterval, uint16_t maxInterval,
+                   uint16_t minSubscriptionInt, uint16_t maxSubscriptionInt,
                    const std::vector<uint32_t>& attributeIds, const std::vector<uint32_t>& eventIds,
                    json_t* matterPayload) {
         chip::app::InteractionModelEngine* imEngine = chip::app::InteractionModelEngine::GetInstance();
@@ -940,8 +949,8 @@ private:
             }
         }
 
-        MatterSubscribe sub(&mCommissioner, nodeId, endpointId, clusterId,
-                             imEngine, minInterval, maxInterval, peerId,
+        MatterSubscribe sub(&mCommissioner, nodeId, imEngine,
+                             minSubscriptionInt, maxSubscriptionInt, peerId,
                              attrPaths, numAttr, evPaths, numEv);
         if (!sub.HasCallback()) {
             MatterError::SetResult(matterPayload, MatterErrorCode::kOutOfMemory);
@@ -1014,17 +1023,17 @@ void MatterController::Stop() { mImpl->Stop(); }
 void MatterController::SetLogLevel(log_levels_t level) { mImpl->SetLogLevel(level); }
 bool MatterController::IsRunning() const { return mImpl->IsRunning(); }
 
-bool MatterController::DeviceCommand(const std::string& action, json_t* matterPayload) {
-    return mImpl->DeviceCommand(action, matterPayload);
+bool MatterController::DeviceCommand(uint64_t nodeId, json_t* matterPayload) {
+    return mImpl->DeviceCommand(nodeId, matterPayload);
 }
-bool MatterController::DeviceRead(const std::string& action, json_t* matterPayload) {
-    return mImpl->DeviceRead(action, matterPayload);
+bool MatterController::DeviceRead(uint64_t nodeId, json_t* matterPayload) {
+    return mImpl->DeviceRead(nodeId, matterPayload);
 }
-bool MatterController::DeviceWrite(const std::string& action, json_t* matterPayload) {
-    return mImpl->DeviceWrite(action, matterPayload);
+bool MatterController::DeviceWrite(uint64_t nodeId, json_t* matterPayload) {
+    return mImpl->DeviceWrite(nodeId, matterPayload);
 }
-bool MatterController::DeviceSubscribe(const std::string& action, json_t* matterPayload) {
-    return mImpl->DeviceSubscribe(action, matterPayload);
+bool MatterController::DeviceSubscribe(uint64_t nodeId, json_t* matterPayload) {
+    return mImpl->DeviceSubscribe(nodeId, matterPayload);
 }
 
 bool MatterController::CommissionDevice(uint64_t nodeId, const char* payload, const char* ssid, const char* password)
@@ -1032,9 +1041,10 @@ bool MatterController::CommissionDevice(uint64_t nodeId, const char* payload, co
     return mImpl->CommissionDevice(nodeId, payload, ssid, password);
 }
 
-bool MatterController::EstablishCaseSessions(const std::vector<uint64_t>& nodeIds, int retryCount)
+bool MatterController::EstablishCaseSessions(const std::vector<uint64_t>& nodeIds, int retryCount,
+                                              uint16_t minSubscriptionInt, uint16_t maxSubscriptionInt)
 {
-    return mImpl->EstablishCaseSessions(nodeIds, retryCount);
+    return mImpl->EstablishCaseSessions(nodeIds, retryCount, minSubscriptionInt, maxSubscriptionInt);
 }
 
 bool MatterController::DeviceDelete(uint64_t nodeId)

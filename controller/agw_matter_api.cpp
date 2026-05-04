@@ -115,45 +115,41 @@ void agw_matter_set_loglevel(int log_level)
 
 // --- Device control APIs ---
 
-bool agw_matter_device_command(const char *action, json_t *matterPayload, json_t *responsePayload)
+bool agw_matter_device_command(uint64_t nodeId, json_t *matterPayload, json_t *responsePayload)
 {
-    bool result = MatterController::singleton().DeviceCommand(action, matterPayload);
+    bool result = MatterController::singleton().DeviceCommand(nodeId, matterPayload);
     BuildResponsePayload(matterPayload, responsePayload);
     return result;
 }
 
-bool agw_matter_device_read(const char *action, json_t *matterPayload, json_t *responsePayload)
+bool agw_matter_device_read(uint64_t nodeId, json_t *matterPayload, json_t *responsePayload)
 {
-    bool result = MatterController::singleton().DeviceRead(action, matterPayload);
+    bool result = MatterController::singleton().DeviceRead(nodeId, matterPayload);
     BuildResponsePayload(matterPayload, responsePayload);
     return result;
 }
 
-bool agw_matter_device_write(const char *action, json_t *matterPayload, json_t *responsePayload)
+bool agw_matter_device_write(uint64_t nodeId, json_t *matterPayload, json_t *responsePayload)
 {
-    bool result = MatterController::singleton().DeviceWrite(action, matterPayload);
+    bool result = MatterController::singleton().DeviceWrite(nodeId, matterPayload);
     BuildResponsePayload(matterPayload, responsePayload);
     return result;
 }
 
-bool agw_matter_device_subscribe(const char *action, json_t *matterPayload, json_t *responsePayload)
+bool agw_matter_device_subscribe(uint64_t nodeId, json_t *matterPayload, json_t *responsePayload)
 {
-    bool result = MatterController::singleton().DeviceSubscribe(action, matterPayload);
+    bool result = MatterController::singleton().DeviceSubscribe(nodeId, matterPayload);
     BuildResponsePayload(matterPayload, responsePayload);
     return result;
 }
 
 // --- Commissioning APIs ---
 
-bool agw_matter_device_commission(uint64_t nodeId, const char *onboardingPayload, const char *ssid, const char *password)
-{
-    return MatterController::singleton().CommissionDevice(nodeId, onboardingPayload, ssid, password);
-}
-
-bool agw_matter_device_connect(uint64_t nodeId, int retryCount)
+bool agw_matter_device_connect(uint64_t nodeId, int retryCount,
+                               uint16_t minSubscriptionInt, uint16_t maxSubscriptionInt)
 {
     std::vector<uint64_t> vec(1, nodeId);
-    return MatterController::singleton().EstablishCaseSessions(vec, retryCount);
+    return MatterController::singleton().EstablishCaseSessions(vec, retryCount, minSubscriptionInt, maxSubscriptionInt);
 }
 
 bool agw_matter_device_delete(uint64_t nodeId)
