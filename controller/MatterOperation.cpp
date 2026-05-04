@@ -48,10 +48,14 @@ void MatterOperation::Complete(bool ok)
     mCv.notify_one();
 }
 
-bool MatterOperation::WaitForCompletion()
+bool MatterOperation::WaitForCompletion(int timeoutSec)
 {
     std::unique_lock<std::mutex> lock(mMutex);
-    mCv.wait(lock, [this] { return mCompleted; });
+    if (!mCv.wait_for(lock, std::chrono::seconds(timeoutSec), [this] { return mCompleted; })) {
+        _LOG_ERROR("WaitForCompletion: timed out after %ds for node %llu",
+                   timeoutSec, (unsigned long long)mNodeId);
+        return false;
+    }
     return mSuccess;
 }
 

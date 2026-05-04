@@ -87,16 +87,15 @@ void MatterDiscovery::SetupMandatorySubscription(uint16_t minSubscriptionInt, ui
     chip::FabricIndex fabricIndex = mCommissioner->GetFabricIndex();
     chip::ScopedNodeId peerId(mNodeId, fabricIndex);
 
-    // Subscribe to known application clusters with wildcard endpoint
+    // Subscribe to known application clusters with wildcard endpoint + wildcard attr
     auto* attrPaths = static_cast<chip::app::AttributePathParams*>(
-        chip::Platform::MemoryCalloc(kNumSubscribeClusters, sizeof(chip::app::AttributePathParams)));
+        chip::Platform::MemoryAlloc(kNumSubscribeClusters * sizeof(chip::app::AttributePathParams)));
     if (!attrPaths) {
         _LOG_ERROR("Discovery: failed to allocate subscription attr paths");
         return;
     }
     for (size_t i = 0; i < kNumSubscribeClusters; i++) {
-        attrPaths[i].mEndpointId = chip::kInvalidEndpointId;
-        attrPaths[i].mClusterId  = kSubscribeClusters[i];
+        new (&attrPaths[i]) chip::app::AttributePathParams(chip::kInvalidEndpointId, kSubscribeClusters[i]);
     }
 
     // Basic Info events: StartUp, ShutDown, Leave
@@ -155,7 +154,7 @@ void MatterDiscovery::OnDeviceConnected(chip::Messaging::ExchangeManager& exchan
     // Path 2: Descriptor (wildcard ep, cluster 0x001D, wildcard attr)
     constexpr size_t kNumPaths = 2;
     auto* attrPaths = static_cast<chip::app::AttributePathParams*>(
-        chip::Platform::MemoryCalloc(kNumPaths, sizeof(chip::app::AttributePathParams)));
+        chip::Platform::MemoryAlloc(kNumPaths * sizeof(chip::app::AttributePathParams)));
     if (!attrPaths) {
         _LOG_ERROR("Discovery: failed to allocate attribute paths");
         chip::Platform::Delete(readClient);
@@ -163,11 +162,8 @@ void MatterDiscovery::OnDeviceConnected(chip::Messaging::ExchangeManager& exchan
         return;
     }
 
-    attrPaths[0].mEndpointId = 0;
-    attrPaths[0].mClusterId  = kBasicInfoCluster;
-
-    attrPaths[1].mEndpointId = chip::kInvalidEndpointId;
-    attrPaths[1].mClusterId  = kDescriptorCluster;
+    new (&attrPaths[0]) chip::app::AttributePathParams(static_cast<chip::EndpointId>(0), kBasicInfoCluster);
+    new (&attrPaths[1]) chip::app::AttributePathParams(chip::kInvalidEndpointId, kDescriptorCluster);
 
     chip::app::ReadPrepareParams params(sessionHandle);
     params.mpAttributePathParamsList = attrPaths;

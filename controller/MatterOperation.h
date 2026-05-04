@@ -17,6 +17,7 @@
 
 #include <controller/CHIPDeviceController.h>
 #include <lib/core/CHIPError.h>
+#include <chrono>
 #include <mutex>
 #include <condition_variable>
 #include <string>
@@ -33,7 +34,7 @@ public:
     chip::NodeId NodeId() const { return mNodeId; }
 
     void Run();
-    bool WaitForCompletion();
+    bool WaitForCompletion(int timeoutSec = 60);
 
     void SetError(int code, const char* msg);
     int ErrorCode() const { return mErrorCode; }
