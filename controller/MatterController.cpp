@@ -712,11 +712,9 @@ public:
             return true;
         }
 
-        std::vector<std::thread> threads;
-        threads.reserve(nodeIds.size());
-
-        for (auto id : nodeIds) {
-            threads.emplace_back([this, id, retryCount, minSubscriptionInt, maxSubscriptionInt]() {
+        std::thread([this, nodeIds, retryCount, minSubscriptionInt, maxSubscriptionInt]() {
+            std::lock_guard<std::mutex> caseLock(mCaseSessionMutex);
+            for (auto id : nodeIds) {
                 MatterSession session(&mCommissioner, id);
                 if (session.Connect(retryCount)) {
                     MatterDiscovery discovery(&mCommissioner, id);
@@ -727,13 +725,11 @@ public:
                     _LOG_ERROR("EstablishCaseSessions: failed for node %llu after %d attempt(s)",
                                (unsigned long long)id, retryCount + 1);
                 }
-            });
-        }
+            }
+            _LOG_INFO("EstablishCaseSessions: completed for %zu device(s)", nodeIds.size());
+        }).detach();
 
-        for (auto& t : threads)
-            t.join();
-
-        _LOG_INFO("EstablishCaseSessions: completed for %zu device(s)", nodeIds.size());
+        _LOG_INFO("EstablishCaseSessions: initiated for %zu device(s)", nodeIds.size());
         return true;
     }
 
@@ -997,6 +993,7 @@ private:
     chip::DeviceLayer::TestOnlyCommissionableDataProvider mCommissionableDataProvider;
     std::unique_ptr<chip::Credentials::DeviceAttestationVerifier> mTestVerifier;
 
+    std::mutex mCaseSessionMutex;
     std::mutex mSubscribeCallbacksMutex;
     std::map<SubscribeKey, MatterSubscribeCallback::Ptr> mSubscribeCallbacks;
 
