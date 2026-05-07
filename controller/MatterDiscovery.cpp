@@ -140,6 +140,12 @@ void MatterDiscovery::OnDeviceConnected(chip::Messaging::ExchangeManager& exchan
               (unsigned long long)mNodeId);
 
     chip::app::InteractionModelEngine* imEngine = chip::app::InteractionModelEngine::GetInstance();
+    if (!imEngine) {
+        _LOG_ERROR("Discovery: IM engine not available");
+        Complete(false);
+        return;
+    }
+
     auto* readClient = chip::Platform::New<chip::app::ReadClient>(
         imEngine, &exchangeMgr, *this,
         chip::app::ReadClient::InteractionType::Read);
@@ -226,6 +232,18 @@ void MatterDiscovery::OnDone(chip::app::ReadClient* apReadClient)
         chip::Platform::Delete(apReadClient);
 
     Complete(true);
+}
+
+void MatterDiscovery::OnDeallocatePaths(chip::app::ReadPrepareParams&& aReadPrepareParams)
+{
+    if (aReadPrepareParams.mpAttributePathParamsList) {
+        chip::Platform::MemoryFree(aReadPrepareParams.mpAttributePathParamsList);
+        aReadPrepareParams.mpAttributePathParamsList = nullptr;
+    }
+    if (aReadPrepareParams.mpEventPathParamsList) {
+        chip::Platform::MemoryFree(aReadPrepareParams.mpEventPathParamsList);
+        aReadPrepareParams.mpEventPathParamsList = nullptr;
+    }
 }
 
 // --- Attribute collection ---

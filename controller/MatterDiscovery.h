@@ -39,12 +39,13 @@ protected:
     void OnDeviceConnected(chip::Messaging::ExchangeManager& exchangeMgr,
                            const chip::SessionHandle& sessionHandle) override;
 
-    // ReadClient::Callback: attribute data, error, done
+    // ReadClient::Callback: attribute data, error, done, path cleanup
     void OnAttributeData(const chip::app::ConcreteDataAttributePath& aPath,
                          chip::TLV::TLVReader* apData,
                          const chip::app::StatusIB& aStatus) override;
     void OnError(CHIP_ERROR aError) override;
     void OnDone(chip::app::ReadClient* apReadClient) override;
+    void OnDeallocatePaths(chip::app::ReadPrepareParams&& aReadPrepareParams) override;
 
 private:
     void SetupMandatorySubscription(uint16_t minSubscriptionInt, uint16_t maxSubscriptionInt);
