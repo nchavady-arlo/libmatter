@@ -165,12 +165,11 @@ CHIP_ERROR EncodeJsonFieldArray(chip::TLV::TLVWriter &writer, chip::TLV::Tag tag
             continue;
         }
 
-        json_t *pseudo = json_object();
+        json_auto_t *pseudo = json_object();
         VerifyOrReturnError(pseudo != nullptr, CHIP_ERROR_NO_MEMORY);
         json_object_set_new(pseudo, "datatype", json_string(elemType));
         json_object_set(pseudo, "value", e);
         CHIP_ERROR err = EncodeJsonFieldObject(writer, pseudo, true);
-        json_decref(pseudo);
         ReturnErrorOnFailure(err);
     }
 
@@ -190,7 +189,7 @@ CHIP_ERROR EncodeJsonFieldValue(chip::TLV::TLVWriter &writer, chip::TLV::Tag tag
         return writer.Put(tag, json_is_true(value));
     }
 
-    if (t == "string")
+    if (t == "string" || t == "char_string")
     {
         VerifyOrReturnError(json_is_string(value), CHIP_ERROR_INVALID_ARGUMENT);
         const char *s = json_string_value(value);
@@ -198,7 +197,7 @@ CHIP_ERROR EncodeJsonFieldValue(chip::TLV::TLVWriter &writer, chip::TLV::Tag tag
         return writer.PutString(tag, s);
     }
 
-    if (t == "octstr")
+    if (t == "octstr" || t == "octet_string")
         return EncodeOctetStringFromJson(writer, tag, value);
 
     if (t == "struct")
@@ -214,28 +213,52 @@ CHIP_ERROR EncodeJsonFieldValue(chip::TLV::TLVWriter &writer, chip::TLV::Tag tag
         return writer.EndContainer(container);
     }
 
-    if (t == "array")
+    if (t == "array" || t == "list")
         return CHIP_ERROR_INVALID_ARGUMENT;
+
+    if (t == "single" || t == "float")
+    {
+        float f = 0;
+        if (json_is_real(value))
+            f = (float)json_real_value(value);
+        else if (json_is_integer(value))
+            f = (float)json_integer_value(value);
+        else
+            return CHIP_ERROR_INVALID_ARGUMENT;
+        return writer.Put(tag, f);
+    }
+
+    if (t == "double")
+    {
+        double d = 0;
+        if (json_is_real(value))
+            d = json_real_value(value);
+        else if (json_is_integer(value))
+            d = (double)json_integer_value(value);
+        else
+            return CHIP_ERROR_INVALID_ARGUMENT;
+        return writer.Put(tag, d);
+    }
 
     int64_t n = 0;
     VerifyOrReturnError(ParseInteger(value, n), CHIP_ERROR_INVALID_ARGUMENT);
 
-    if (t == "uint8" || t == "enum8" || t == "map8")
+    if (t == "uint8" || t == "enum8" || t == "map8" || t == "bitmap8")
     {
         VerifyOrReturnError(n >= 0 && n <= UINT8_MAX, CHIP_ERROR_INVALID_ARGUMENT);
         return writer.Put(tag, static_cast<uint8_t>(n), true);
     }
-    if (t == "uint16" || t == "enum16" || t == "map16")
+    if (t == "uint16" || t == "enum16" || t == "map16" || t == "bitmap16")
     {
         VerifyOrReturnError(n >= 0 && n <= UINT16_MAX, CHIP_ERROR_INVALID_ARGUMENT);
         return writer.Put(tag, static_cast<uint16_t>(n), true);
     }
-    if (t == "uint32" || t == "map32")
+    if (t == "uint32" || t == "map32" || t == "bitmap32")
     {
         VerifyOrReturnError(n >= 0, CHIP_ERROR_INVALID_ARGUMENT);
         return writer.Put(tag, static_cast<uint32_t>(n), true);
     }
-    if (t == "uint64" || t == "map64")
+    if (t == "uint64" || t == "map64" || t == "bitmap64")
     {
         VerifyOrReturnError(n >= 0, CHIP_ERROR_INVALID_ARGUMENT);
         return writer.Put(tag, static_cast<uint64_t>(n), true);
@@ -404,6 +427,50 @@ json_t *TlvToJson(chip::TLV::TLVReader *reader)
         if (reader->Get(val) == CHIP_NO_ERROR)
             return json_stringn(val.data(), val.size());
         break;
+    }
+    case chip::TLV::kTLVType_ByteString: {
+        chip::ByteSpan val;
+        if (reader->Get(val) == CHIP_NO_ERROR) {
+            size_t b64Len = BASE64_ENCODED_LEN(val.size());
+            std::vector<char> buf(b64Len + 1);
+            uint16_t encoded = chip::Base64Encode(val.data(), static_cast<uint16_t>(val.size()), buf.data());
+            buf[encoded] = '\0';
+            return json_string(buf.data());
+        }
+        break;
+    }
+    case chip::TLV::kTLVType_Array: {
+        json_t *arr = json_array();
+        chip::TLV::TLVType container;
+        if (reader->EnterContainer(container) != CHIP_NO_ERROR) {
+            json_decref(arr);
+            break;
+        }
+        while (reader->Next() == CHIP_NO_ERROR) {
+            json_t *elem = TlvToJson(reader);
+            json_array_append_new(arr, elem ? elem : json_null());
+        }
+        reader->ExitContainer(container);
+        return arr;
+    }
+    case chip::TLV::kTLVType_Structure: {
+        json_t *obj = json_object();
+        chip::TLV::TLVType container;
+        if (reader->EnterContainer(container) != CHIP_NO_ERROR) {
+            json_decref(obj);
+            break;
+        }
+        while (reader->Next() == CHIP_NO_ERROR) {
+            chip::TLV::Tag tag = reader->GetTag();
+            if (chip::TLV::IsContextTag(tag)) {
+                char key[16];
+                snprintf(key, sizeof(key), "%u", static_cast<unsigned>(chip::TLV::TagNumFromTag(tag)));
+                json_t *val = TlvToJson(reader);
+                json_object_set_new(obj, key, val ? val : json_null());
+            }
+        }
+        reader->ExitContainer(container);
+        return obj;
     }
     case chip::TLV::kTLVType_Null:
         return json_null();

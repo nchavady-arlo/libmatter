@@ -46,14 +46,15 @@ public:
     bool IsRunning() const;
 
     // Device control (split from ParseRequest)
-    bool DeviceCommand(const std::string& action, json_t* matterPayload);
-    bool DeviceRead(const std::string& action, json_t* matterPayload);
-    bool DeviceWrite(const std::string& action, json_t* matterPayload);
-    bool DeviceSubscribe(const std::string& action, json_t* matterPayload);
+    bool DeviceCommand(uint64_t nodeId, json_t* matterPayload);
+    bool DeviceRead(uint64_t nodeId, json_t* matterPayload);
+    bool DeviceWrite(uint64_t nodeId, json_t* matterPayload);
+    bool DeviceSubscribe(uint64_t nodeId, json_t* matterPayload);
 
     // Commissioning
     bool CommissionDevice(uint64_t nodeId, const char* payload, const char* ssid = nullptr, const char* password = nullptr);
-    bool EstablishCaseSessions(const std::vector<uint64_t>& nodeIds, int retryCount);
+    bool EstablishCaseSessions(const std::vector<uint64_t>& nodeIds, int retryCount,
+                               uint16_t minSubscriptionInt, uint16_t maxSubscriptionInt);
     bool DeviceDelete(uint64_t nodeId);
 
     static MatterController& singleton()

@@ -21,6 +21,7 @@ SRCS := \
 	controller/MatterError.cpp \
 	controller/MatterJsonUtils.cpp \
 	controller/MatterCommand.cpp \
+	controller/MatterDiscovery.cpp \
 	controller/MatterSubscribe.cpp \
 	controller/MatterPublish.cpp \
 	controller/MinimalDataModelProvider.cpp \
