@@ -33,7 +33,7 @@ public:
     ~MatterController();
 
     // Three-phase lifecycle
-    bool Init(log_levels_t level);
+    bool Init();
     bool IsBootstrapRequired();
     bool GenerateBootstrapCsr(const char *csr_nonce, char **csr_pem, char **nocsr_elements);
     bool Bootstrap(const uint8_t *rcac, size_t rcac_len,
@@ -42,7 +42,6 @@ public:
                    const uint8_t *noc, size_t noc_len);
     bool Start();
     void Stop();
-    void SetLogLevel(log_levels_t level);
     bool IsRunning() const;
 
     // Device control (split from ParseRequest)
