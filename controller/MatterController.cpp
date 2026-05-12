@@ -47,7 +47,6 @@
 #include <platform/KvsPersistentStorageDelegate.h>
 #include <platform/TestOnlyCommissionableDataProvider.h>
 #include "MinimalDataModelProvider.h"
-#include <lib/support/logging/CHIPLogging.h>
 #include <credentials/DeviceAttestationConstructor.h>
 #include <lib/support/Base64.h>
 #include <algorithm>
@@ -148,42 +147,12 @@ public:
         return future.get();
     }
 
-    void SetLogLevel(log_levels_t level) {
-        chip::Logging::LogCategory result = chip::Logging::kLogCategory_Error;
-        switch(level) {
-            case LL_EMERG:
-            case LL_ALERT:
-            case LL_CRIT:
-            case LL_ERROR:
-                result = chip::Logging::kLogCategory_Error;
-                break;
-            case LL_WARNING:
-            case LL_NOTICE:
-            case LL_INFO:
-                result = chip::Logging::kLogCategory_Progress;
-                break;
-            case LL_DEBUG:
-                result = chip::Logging::kLogCategory_Detail;
-                break;
-            case LL_TRACE:
-                result = chip::Logging::kLogCategory_Automation;
-                break;
-            case LL_MAX:
-                result = chip::Logging::kLogCategory_Error;
-                break;
-        }
-        chip::Logging::SetLogFilter(static_cast<uint8_t>(result));
-    }
-
     // Phase 1: Platform + KVS initialization
-    bool Init(log_levels_t level) {
+    bool Init() {
         if (mInitialized) {
             _LOG_WARNING("Matter controller already initialized");
             return true;
         }
-
-        SetLogLevel(level);
-
         CHIP_ERROR err = chip::Platform::MemoryInit();
         if (err != CHIP_NO_ERROR) {
             _LOG_ERROR("Platform::MemoryInit failed: %s", chip::ErrorStr(err));
@@ -713,7 +682,6 @@ public:
         }
 
         std::thread([this, nodeIds, retryCount, minSubscriptionInt, maxSubscriptionInt]() {
-            std::lock_guard<std::mutex> caseLock(mCaseSessionMutex);
             for (auto id : nodeIds) {
                 MatterSession session(&mCommissioner, id);
                 if (session.Connect(retryCount)) {
@@ -993,7 +961,6 @@ private:
     chip::DeviceLayer::TestOnlyCommissionableDataProvider mCommissionableDataProvider;
     std::unique_ptr<chip::Credentials::DeviceAttestationVerifier> mTestVerifier;
 
-    std::mutex mCaseSessionMutex;
     std::mutex mSubscribeCallbacksMutex;
     std::map<SubscribeKey, MatterSubscribeCallback::Ptr> mSubscribeCallbacks;
 
@@ -1004,7 +971,7 @@ private:
 MatterController::MatterController() : mImpl(std::make_unique<MatterControllerImpl>()) {}
 MatterController::~MatterController() = default;
 
-bool MatterController::Init(log_levels_t level) { return mImpl->Init(level); }
+bool MatterController::Init() { return mImpl->Init(); }
 bool MatterController::IsBootstrapRequired() { return mImpl->IsBootstrapRequired(); }
 bool MatterController::GenerateBootstrapCsr(const char *csr_nonce, char **csr_pem, char **nocsr_elements) {
     return mImpl->GenerateBootstrapCsr(csr_nonce, csr_pem, nocsr_elements);
@@ -1017,7 +984,6 @@ bool MatterController::Bootstrap(const uint8_t *rcac, size_t rcac_len,
 }
 bool MatterController::Start() { return mImpl->Start(); }
 void MatterController::Stop() { mImpl->Stop(); }
-void MatterController::SetLogLevel(log_levels_t level) { mImpl->SetLogLevel(level); }
 bool MatterController::IsRunning() const { return mImpl->IsRunning(); }
 
 bool MatterController::DeviceCommand(uint64_t nodeId, json_t* matterPayload) {

@@ -62,9 +62,9 @@ extern "C" {
 
 // --- Lifecycle APIs ---
 
-bool agw_matter_init(int log_level)
+bool agw_matter_init(void)
 {
-    return MatterController::singleton().Init(static_cast<log_levels_t>(log_level));
+    return MatterController::singleton().Init();
 }
 
 bool agw_matter_is_bootstrap_required(void)
@@ -106,11 +106,6 @@ void agw_matter_stop(void)
 bool agw_matter_is_running(void)
 {
     return MatterController::singleton().IsRunning();
-}
-
-void agw_matter_set_loglevel(int log_level)
-{
-    MatterController::singleton().SetLogLevel(static_cast<log_levels_t>(log_level));
 }
 
 // --- Device control APIs ---
