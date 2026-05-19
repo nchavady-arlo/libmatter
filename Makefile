@@ -25,7 +25,8 @@ SRCS := \
 	controller/MatterSubscribe.cpp \
 	controller/MatterPublish.cpp \
 	controller/MinimalDataModelProvider.cpp \
-	controller/agw_matter_api.cpp
+	controller/agw_matter_api.cpp \
+	controller/Logging.cpp
 
 OBJS := $(addprefix $(OBJDIR)/, $(notdir $(SRCS:.cpp=.o)))
 
